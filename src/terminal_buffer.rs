@@ -12,8 +12,10 @@ pub struct TerminalCell {
     /// Foreground colour as an sRGB triple `[r, g, b]`.
     pub fg: [u8; 3],
     /// Background colour as an sRGB triple `[r, g, b]`.
+    #[allow(dead_code)]
     pub bg: [u8; 3],
     /// Whether the cell is rendered in bold.
+    #[allow(dead_code)]
     pub bold: bool,
 }
 
@@ -85,6 +87,7 @@ impl TerminalBuffer {
     }
 
     /// Erase the display and move the cursor to the origin (row 0, col 0).
+    #[allow(dead_code)]
     pub fn clear_screen(&mut self) {
         self.parser.process(b"\x1b[2J\x1b[H");
         self.cursor_row = 0;
@@ -124,6 +127,7 @@ impl TerminalBuffer {
 
     /// Return the screen as a newline-joined string with trailing whitespace
     /// trimmed per row (useful for testing and clipboard copy).
+    #[allow(dead_code)]
     pub fn get_text(&self) -> String {
         let screen = self.parser.screen();
         (0..self.rows as u16)

@@ -100,6 +100,7 @@ impl WindowManager {
         self.focused_id = Some(id.to_string());
     }
 
+    #[allow(dead_code)]
     pub fn close_window(&mut self, id: &str) {
         self.windows.retain(|w| w.id != id);
         if self.focused_id.as_deref() == Some(id) {
@@ -186,6 +187,7 @@ impl WindowManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn focused_session_id(&self) -> Option<&str> {
         self.focused_id.as_ref().and_then(|fid| {
             self.windows

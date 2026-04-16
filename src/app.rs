@@ -181,7 +181,7 @@ impl MultiCliApp {
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("{} {}", kind.label(), self.session_counter));
         let session = ShellSession::new(
-            id.clone(), name.clone(), kind,
+            kind,
             self.settings.pty_cols, self.settings.pty_rows, initial_dir,
         );
         self.sessions.insert(id.clone(), session);

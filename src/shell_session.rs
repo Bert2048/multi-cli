@@ -69,21 +69,18 @@ impl ShellKind {
 /// `portable_pty` pair), a writer thread (channel → PTY master), and a reader
 /// thread (PTY master → [`TerminalBuffer`]).
 pub struct ShellSession {
-    pub id: String,
-    pub name: String,
     pub kind: ShellKind,
     /// Shared terminal state; lock briefly only to read/write, never across frames.
     pub buffer: Arc<Mutex<TerminalBuffer>>,
     /// Send raw bytes to the shell's stdin via the PTY writer thread.
     pub input_tx: Sender<Vec<u8>>,
     /// Set to `false` by the reader thread when the shell process exits.
+    #[allow(dead_code)]
     pub alive: Arc<Mutex<bool>>,
 }
 
 impl ShellSession {
     pub fn new(
-        id: String,
-        name: String,
         kind: ShellKind,
         cols: u16,
         rows: u16,
@@ -194,8 +191,6 @@ impl ShellSession {
         });
 
         Self {
-            id,
-            name,
             kind,
             buffer,
             input_tx,
@@ -209,6 +204,7 @@ impl ShellSession {
     }
 
     /// Returns `true` while the shell process is still running.
+    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         *self.alive.lock().unwrap()
     }
