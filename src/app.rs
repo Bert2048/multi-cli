@@ -20,9 +20,45 @@ const TEXT_DIM: Color32 = Color32::from_rgb(110, 110, 130);
 const RED: Color32 = Color32::from_rgb(210, 70, 70);
 const YELLOW: Color32 = Color32::from_rgb(230, 190, 60);
 const TITLEBAR_H: f32 = 28.0;
-const SIDEBAR_W: f32 = 160.0;
 const TOOLBAR_H: f32 = 40.0;
 const STATUS_H: f32 = 18.0;
+
+/// Persisted user preferences, saved to `%APPDATA%/multi-cli/settings.json`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppSettings {
+    /// Terminal font size in pixels (range 8–24).
+    pub font_size: f32,
+    /// `line_h = font_size × line_height_scale`.
+    pub line_height_scale: f32,
+    /// Shell opened by Ctrl+N and the NEW button.
+    pub default_shell: ShellKind,
+    /// PTY column count for new sessions.
+    pub pty_cols: u16,
+    /// PTY row count for new sessions.
+    pub pty_rows: u16,
+    /// Sidebar panel width in pixels.
+    pub sidebar_width: f32,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 12.0,
+            line_height_scale: 14.0 / 12.0, // ≈ 1.167
+            default_shell: ShellKind::PowerShell,
+            pty_cols: 120,
+            pty_rows: 40,
+            sidebar_width: 160.0,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Pixel width of one character column at the current font size.
+    pub fn char_w(&self) -> f32 { self.font_size * (7.4 / 12.0) }
+    /// Pixel height of one terminal line at the current font size and spacing.
+    pub fn line_h(&self) -> f32 { self.font_size * self.line_height_scale }
+}
 
 /// Root application state owned by `eframe`, updated every frame.
 ///
@@ -39,6 +75,11 @@ pub struct MultiCliApp {
     rename_buf: String,
     confirm_close_id: Option<String>,
     last_save: std::time::Instant,
+    text_selection: Option<TextSelection>,
+    sel_dragging: bool,
+    context_menu: Option<(Pos2, String)>, // (screen_pos, window_id)
+    settings: AppSettings,
+    show_settings: bool,
 }
 
 struct DragState {
@@ -78,13 +119,27 @@ struct ResizeState {
     start_mouse: Pos2,
 }
 
+struct TextSelection {
+    window_id: String,
+    anchor: (usize, usize), // (buf_row, col)
+    focus: (usize, usize),
+}
+
+impl TextSelection {
+    fn range(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.focus { (self.anchor, self.focus) } else { (self.focus, self.anchor) }
+    }
+    fn is_empty(&self) -> bool { self.anchor == self.focus }
+}
+
 impl MultiCliApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         setup_cjk_font(&cc.egui_ctx);
+        let settings = load_settings_from_disk();
         let mut app = Self {
             wm: WindowManager::new(),
             sessions: HashMap::new(),
-            new_shell_kind: ShellKind::PowerShell,
+            new_shell_kind: settings.default_shell.clone(),
             session_counter: 0,
             drag_state: None,
             resize_state: None,
@@ -92,9 +147,22 @@ impl MultiCliApp {
             rename_buf: String::new(),
             confirm_close_id: None,
             last_save: std::time::Instant::now(),
+            text_selection: None,
+            sel_dragging: false,
+            context_menu: None,
+            settings,
+            show_settings: false,
         };
         app.load_state_or_default();
         app
+    }
+
+    fn save_settings(&self) {
+        if let Some(path) = settings_path() {
+            if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
+                let _ = std::fs::write(path, json);
+            }
+        }
     }
 
     fn spawn_shell(&mut self, kind: ShellKind) {
@@ -112,7 +180,10 @@ impl MultiCliApp {
         self.session_counter += 1;
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("{} {}", kind.label(), self.session_counter));
-        let session = ShellSession::new(id.clone(), name.clone(), kind, 120, 40, initial_dir);
+        let session = ShellSession::new(
+            id.clone(), name.clone(), kind,
+            self.settings.pty_cols, self.settings.pty_rows, initial_dir,
+        );
         self.sessions.insert(id.clone(), session);
         let win_id = self.wm.add_window(id, name);
         if let (Some(p), Some(s)) = (pos, size) {
@@ -140,6 +211,7 @@ impl MultiCliApp {
                 "width": w.size.x,
                 "height": w.size.y,
                 "minimized": w.minimized,
+                "focused": w.focused,
                 "last_dir": last_dir,
             })
         }).collect();
@@ -159,7 +231,11 @@ impl MultiCliApp {
                         self.wm.windows.clear();
                         self.wm.focused_id = None;
 
-                        for w in windows {
+                        let mut focused_idx: Option<usize> = None;
+                        for (idx, w) in windows.iter().enumerate() {
+                            if w["focused"].as_bool().unwrap_or(false) {
+                                focused_idx = Some(idx);
+                            }
                             let name = w["name"].as_str().unwrap_or("Shell").to_string();
                             let kind = match w["kind"].as_str().unwrap_or("PowerShell") {
                                 "CMD" | "Cmd" => ShellKind::Cmd,
@@ -181,6 +257,12 @@ impl MultiCliApp {
                                 Some(egui::Vec2::new(width, height)),
                             );
                         }
+                        if let Some(idx) = focused_idx {
+                            if let Some(win) = self.wm.windows.get(idx) {
+                                let id = win.id.clone();
+                                self.wm.focus(&id);
+                            }
+                        }
                         return;
                     }
                 }
@@ -199,11 +281,201 @@ impl MultiCliApp {
         }
         self.spawn_shell(ShellKind::PowerShell);
     }
+
+    /// Draws the floating settings window. Returns `true` if the window should
+    /// stay open, `false` if the user closed it (so the caller can save).
+    fn draw_settings_window(&mut self, ctx: &egui::Context) -> bool {
+        let mut open = true;
+        let mut save_and_close = false;
+        let mut reset = false;
+
+        egui::Window::new("⚙  SETTINGS")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(Vec2::new(380.0, 0.0)) // height auto-fits
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(egui::Margin::same(16.0)),
+            )
+            .show(ctx, |ui| {
+                ui.style_mut().visuals.override_text_color = Some(TEXT);
+
+                // ── APPEARANCE ────────────────────────────────────────────
+                settings_section(ui, "APPEARANCE");
+                egui::Grid::new("s_appearance")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .min_col_width(110.0)
+                    .show(ui, |ui| {
+                        ui.label(settings_label("Font Size"));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.font_size, 8.0..=24.0)
+                                .step_by(0.5)
+                                .suffix(" px")
+                                .clamp_to_range(true),
+                        );
+                        ui.end_row();
+
+                        ui.label(settings_label("Line Spacing"));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.line_height_scale, 1.0..=2.0)
+                                .step_by(0.05)
+                                .fixed_decimals(2)
+                                .suffix("×")
+                                .clamp_to_range(true),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(14.0);
+
+                // ── TERMINAL ──────────────────────────────────────────────
+                settings_section(ui, "TERMINAL");
+                egui::Grid::new("s_terminal")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .min_col_width(110.0)
+                    .show(ui, |ui| {
+                        ui.label(settings_label("Default Shell"));
+                        egui::ComboBox::from_id_source("settings_shell_combo")
+                            .selected_text(self.settings.default_shell.label())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.default_shell,
+                                    ShellKind::PowerShell, "PowerShell",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.default_shell,
+                                    ShellKind::Cmd, "CMD",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.default_shell,
+                                    ShellKind::Bash, "Bash",
+                                );
+                            });
+                        ui.end_row();
+
+                        ui.label(settings_label("PTY Columns"));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.pty_cols, 40u16..=300u16)
+                                .clamp_to_range(true),
+                        );
+                        ui.end_row();
+
+                        ui.label(settings_label("PTY Rows"));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.pty_rows, 10u16..=100u16)
+                                .clamp_to_range(true),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("  PTY size changes apply to new sessions only")
+                        .font(FontId::new(10.0, FontFamily::Monospace))
+                        .color(TEXT_DIM),
+                );
+
+                ui.add_space(14.0);
+
+                // ── LAYOUT ────────────────────────────────────────────────
+                settings_section(ui, "LAYOUT");
+                egui::Grid::new("s_layout")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .min_col_width(110.0)
+                    .show(ui, |ui| {
+                        ui.label(settings_label("Sidebar Width"));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.sidebar_width, 80.0..=300.0)
+                                .suffix(" px")
+                                .clamp_to_range(true),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // ── Action buttons ────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    if ui.add(
+                        egui::Button::new(
+                            RichText::new("RESET DEFAULTS")
+                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                .color(YELLOW),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(0.8, YELLOW.linear_multiply(0.5)))
+                        .min_size(Vec2::new(140.0, 28.0)),
+                    ).clicked() {
+                        reset = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new("SAVE & CLOSE")
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM)
+                            .min_size(Vec2::new(130.0, 28.0)),
+                        ).clicked() {
+                            save_and_close = true;
+                        }
+                    });
+                });
+            });
+
+        if reset {
+            self.settings = AppSettings::default();
+        }
+        if save_and_close {
+            self.save_settings();
+            return false;
+        }
+        // Sync toolbar dropdown with any default_shell change
+        self.new_shell_kind = self.settings.default_shell.clone();
+        open
+    }
+}
+
+fn extract_selection_text(
+    lines: &[Vec<crate::terminal_buffer::TerminalCell>],
+    start: (usize, usize),
+    end: (usize, usize),
+) -> String {
+    let mut out = String::new();
+    for row in start.0..=end.0 {
+        let Some(line) = lines.get(row) else { break };
+        let c0 = if row == start.0 { start.1 } else { 0 };
+        let c1 = if row == end.0 { end.1 } else { line.len() };
+        for col in c0..c1.min(line.len()) {
+            out.push(line[col].ch);
+        }
+        if row < end.0 { out.push('\n'); }
+    }
+    out.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n")
 }
 
 impl eframe::App for MultiCliApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+        // Derive rendering metrics from settings each frame
+        let char_w   = self.settings.char_w();
+        let line_h   = self.settings.line_h();
+        let sidebar_w = self.settings.sidebar_width;
+        let font_sz  = self.settings.font_size;
 
         // Auto-save every 60 seconds
         if self.last_save.elapsed() >= std::time::Duration::from_secs(60) {
@@ -280,12 +552,19 @@ impl eframe::App for MultiCliApp {
                     if toolbar_btn(ui, "LOAD", TEXT_DIM).clicked() {
                         self.load_state();
                     }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let settings_color = if self.show_settings { ACCENT } else { TEXT_DIM };
+                        if toolbar_btn(ui, "⚙ SETTINGS", settings_color).clicked() {
+                            self.show_settings = !self.show_settings;
+                        }
+                    });
                 });
             });
 
         // --- Sidebar ---
         egui::SidePanel::left("sidebar")
-            .exact_width(SIDEBAR_W)
+            .exact_width(sidebar_w)
             .resizable(false)
             .frame(egui::Frame::none().fill(SURFACE).inner_margin(egui::Margin::same(0.0)))
             .show(ctx, |ui| {
@@ -315,7 +594,7 @@ impl eframe::App for MultiCliApp {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.rename_buf)
                                     .font(FontId::new(11.0, FontFamily::Monospace))
-                                    .desired_width(SIDEBAR_W - 8.0),
+                                    .desired_width(sidebar_w - 8.0),
                             );
                             if ui.input(|i| i.key_pressed(Key::Escape)) {
                                 self.renaming_id = None;
@@ -326,7 +605,7 @@ impl eframe::App for MultiCliApp {
                         });
                     } else {
                         ui.horizontal(|ui| {
-                            let btn_w = SIDEBAR_W - 30.0; // leave room for ✕
+                            let btn_w = sidebar_w - 30.0; // leave room for ✕
                             let resp = ui.add(
                                 egui::Button::new(
                                     RichText::new(format!("{} {}", if is_focused { "▶" } else { " " }, title))
@@ -421,11 +700,14 @@ impl eframe::App for MultiCliApp {
                 // Handle pointer events
                 let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
                 let pointer_down = ctx.input(|i| i.pointer.primary_down());
+                let pointer_pressed = ctx.input(|i| i.pointer.primary_pressed());
                 let pointer_released = ctx.input(|i| i.pointer.primary_released());
+                let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
 
                 if pointer_released {
                     self.drag_state = None;
                     self.resize_state = None;
+                    self.sel_dragging = false;
                 }
 
                 // Apply drag
@@ -476,6 +758,10 @@ impl eframe::App for MultiCliApp {
                 let mut start_drag: Option<(String, Vec2)> = None;
                 let mut start_resize: Option<(String, ResizeEdges, Pos2, Vec2, Pos2)> = None;
                 let _input_submits: Vec<(String, String)> = Vec::new();
+                let mut new_selection: Option<TextSelection> = None;
+                let mut sel_focus_update: Option<(String, usize, usize)> = None;
+                let mut start_sel_drag = false;
+                let mut new_context_menu: Option<(Pos2, String)> = None;
 
                 for &wi in &sorted {
                     let win = &self.wm.windows[wi];
@@ -547,10 +833,9 @@ impl eframe::App for MultiCliApp {
                     );
 
                     // Render terminal content
+                    let mut visible_start: usize = 0;
                     if let Some(session) = self.sessions.get(&session_id) {
                         let buf = session.buffer.lock().unwrap();
-                        let line_h = 14.0;
-                        let char_w = 7.4; // narrow (ASCII) cell width
                         let visible_rows = ((size.y - STATUS_H) / line_h) as usize;
                         let lines = buf.visible_lines();
                         // In alternate screen (TUI), show from scroll_offset (always 0).
@@ -560,11 +845,36 @@ impl eframe::App for MultiCliApp {
                         } else {
                             (buf.cursor_row + 1).saturating_sub(visible_rows)
                         };
+                        visible_start = start;
 
                         // Clip all terminal drawing to the content rect
                         let term_painter = painter.with_clip_rect(term_rect);
                         for (row_idx, row) in lines[start..].iter().enumerate() {
                             let y = term_rect.min.y + row_idx as f32 * line_h + 2.0;
+                            let buf_row = start + row_idx;
+
+                            // Selection highlight (drawn before characters)
+                            if let Some(sel) = &self.text_selection {
+                                if sel.window_id == win_id && !sel.is_empty() {
+                                    let ((sr, sc), (er, ec)) = sel.range();
+                                    if buf_row >= sr && buf_row <= er {
+                                        let c0 = if buf_row == sr { sc } else { 0 };
+                                        let c1 = if buf_row == er { ec } else { row.len().max(1) };
+                                        let x0 = term_rect.min.x + 4.0 + c0 as f32 * char_w;
+                                        let x1 = (term_rect.min.x + 4.0 + c1 as f32 * char_w)
+                                            .min(term_rect.max.x);
+                                        term_painter.rect_filled(
+                                            Rect::from_min_max(
+                                                Pos2::new(x0, y - 2.0),
+                                                Pos2::new(x1, y + line_h - 2.0),
+                                            ),
+                                            Rounding::ZERO,
+                                            Color32::from_rgba_unmultiplied(80, 200, 160, 80),
+                                        );
+                                    }
+                                }
+                            }
+
                             for (col_idx, cell) in row.iter().enumerate() {
                                 let col_x = term_rect.min.x + 4.0 + col_idx as f32 * char_w;
                                 if col_x >= term_rect.max.x - char_w {
@@ -576,7 +886,7 @@ impl eframe::App for MultiCliApp {
                                         Pos2::new(col_x, y),
                                         egui::Align2::LEFT_TOP,
                                         cell.ch.to_string(),
-                                        FontId::new(12.0, FontFamily::Monospace),
+                                        FontId::new(font_sz, FontFamily::Monospace),
                                         fg,
                                     );
                                 }
@@ -659,32 +969,72 @@ impl eframe::App for MultiCliApp {
                             bottom: (mpos.y - win_rect.max.y).abs() < ez && in_x,
                         };
 
-                        // Cursor icon when hovering an edge
-                        if edges.any() && self.drag_state.is_none() {
-                            ctx.output_mut(|o| o.cursor_icon = edges.cursor());
+                        // Cursor icon — higher-z windows override lower ones.
+                        // win_rect.contains resets cursor when interior covers the mouse.
+                        if self.drag_state.is_none() && self.resize_state.is_none() {
+                            if edges.any() {
+                                ctx.output_mut(|o| o.cursor_icon = edges.cursor());
+                            } else if win_rect.contains(mpos) {
+                                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Default);
+                            }
                         }
 
                         if pointer_down && self.drag_state.is_none() && self.resize_state.is_none() {
-                            // Click anywhere on window → focus
                             if win_rect.expand(ez).contains(mpos) {
+                                // This window claims the mouse — override any interaction
+                                // that was set by a lower-z window in a previous iteration.
                                 focus_request = Some(win_id.clone());
-                            }
+                                start_resize = None;
+                                start_drag = None;
 
-                            // Close button → hide window (session stays alive)
-                            if (mpos - close_btn_center).length() < 7.0 {
-                                close_request = Some(win_id.clone());
-                            }
+                                // Close button → hide window (session stays alive)
+                                if (mpos - close_btn_center).length() < 7.0 {
+                                    close_request = Some(win_id.clone());
+                                }
 
-                            // Edge resize (takes priority over titlebar drag)
-                            if edges.any() {
-                                start_resize = Some((win_id.clone(), edges, win_rect.min, size, mpos));
-                            } else if titlebar_rect.contains(mpos)
-                                && (mpos - close_btn_center).length() > 8.0
+                                // Edge resize (takes priority over titlebar drag)
+                                if edges.any() {
+                                    start_resize = Some((win_id.clone(), edges, win_rect.min, size, mpos));
+                                } else if titlebar_rect.contains(mpos)
+                                    && (mpos - close_btn_center).length() > 8.0
+                                    && !self.sel_dragging
+                                {
+                                    // Titlebar drag
+                                    let off = mpos - win_rect.min;
+                                    start_drag = Some((win_id.clone(), off));
+                                }
+                            }
+                        }
+
+                        // Selection: start on primary press inside terminal area
+                        if pointer_pressed && term_rect.contains(mpos)
+                            && self.drag_state.is_none()
+                            && self.resize_state.is_none()
+                        {
+                            let col = ((mpos.x - term_rect.min.x - 4.0).max(0.0) / char_w) as usize;
+                            let vis_r = ((mpos.y - term_rect.min.y - 2.0).max(0.0) / line_h) as usize;
+                            new_selection = Some(TextSelection {
+                                window_id: win_id.clone(),
+                                anchor: (visible_start + vis_r, col),
+                                focus:  (visible_start + vis_r, col),
+                            });
+                            start_sel_drag = true;
+                        }
+
+                        // Selection: extend focus while drag is active
+                        if self.sel_dragging && pointer_down {
+                            if self.text_selection.as_ref()
+                                .map(|s| s.window_id.as_str()) == Some(win_id.as_str())
                             {
-                                // Titlebar drag
-                                let off = mpos - win_rect.min;
-                                start_drag = Some((win_id.clone(), off));
+                                let col = ((mpos.x - term_rect.min.x - 4.0).max(0.0) / char_w) as usize;
+                                let vis_r = ((mpos.y - term_rect.min.y - 2.0).max(0.0) / line_h) as usize;
+                                sel_focus_update = Some((win_id.clone(), visible_start + vis_r, col));
                             }
+                        }
+
+                        // Right-click: open context menu
+                        if secondary_pressed && win_rect.contains(mpos) {
+                            new_context_menu = Some((mpos, win_id.clone()));
                         }
                     }
                 }
@@ -715,6 +1065,16 @@ impl eframe::App for MultiCliApp {
                         start_mouse: mouse_pos,
                     });
                 }
+                if let Some(sel) = new_selection {
+                    self.text_selection = Some(sel);
+                }
+                if let Some((wid, row, col)) = sel_focus_update {
+                    if let Some(sel) = self.text_selection.as_mut() {
+                        if sel.window_id == wid { sel.focus = (row, col); }
+                    }
+                }
+                if start_sel_drag { self.sel_dragging = true; }
+                if let Some(cm) = new_context_menu { self.context_menu = Some(cm); }
 
                 // Keyboard input → direct PTY passthrough (shell-style)
                 // Skip when the rename input is active to avoid dual input
@@ -727,8 +1087,6 @@ impl eframe::App for MultiCliApp {
                     if let Some((sid, win_pos, win_size)) = win_info {
                         if let Some(session) = self.sessions.get(&sid) {
                             // Tell egui where the cursor is so the IME candidate window follows it
-                            let line_h = 14.0;
-                            let char_w = 7.4;
                             let visible_rows = ((win_size.y - STATUS_H) / line_h) as usize;
                             let (cur_row, cur_col) = {
                                 let buf = session.buffer.lock().unwrap();
@@ -779,6 +1137,94 @@ impl eframe::App for MultiCliApp {
                 }
                 } // end if renaming_id.is_none()
             });
+
+        // --- Settings window ---
+        if self.show_settings {
+            let was_open = true;
+            let still_open = self.draw_settings_window(ctx);
+            if was_open && !still_open {
+                self.save_settings();
+            }
+            self.show_settings = still_open;
+        }
+
+        // --- Context menu (right-click copy/paste) ---
+        let mut close_ctx_menu = false;
+        if let Some((menu_pos, ref menu_win_id)) = self.context_menu.clone() {
+            let sid = self.wm.windows.iter()
+                .find(|w| &w.id == menu_win_id)
+                .map(|w| w.session_id.clone());
+
+            let inner = egui::Area::new(egui::Id::new("ctx_menu"))
+                .fixed_pos(menu_pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(SURFACE2)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::same(4.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(90.0);
+
+                            let has_sel = self.text_selection.as_ref()
+                                .map(|s| &s.window_id == menu_win_id && !s.is_empty())
+                                .unwrap_or(false);
+
+                            let copy_label = RichText::new("  Copy")
+                                .font(FontId::new(12.0, FontFamily::Monospace))
+                                .color(if has_sel { TEXT } else { TEXT_DIM });
+                            if ui.add(egui::Button::new(copy_label)
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false)
+                                .min_size(Vec2::new(90.0, 22.0))
+                            ).clicked() && has_sel {
+                                if let Some(sel) = &self.text_selection {
+                                    if let Some(w) = self.wm.windows.iter().find(|w| &w.id == &sel.window_id) {
+                                        if let Some(session) = self.sessions.get(&w.session_id) {
+                                            if let Ok(buf) = session.buffer.lock() {
+                                                let lines = buf.visible_lines();
+                                                let (sr, er) = sel.range();
+                                                let text = extract_selection_text(&lines, sr, er);
+                                                ctx.output_mut(|o| o.copied_text = text);
+                                            }
+                                        }
+                                    }
+                                }
+                                close_ctx_menu = true;
+                            }
+
+                            let paste_label = RichText::new("  Paste")
+                                .font(FontId::new(12.0, FontFamily::Monospace))
+                                .color(TEXT);
+                            if ui.add(egui::Button::new(paste_label)
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false)
+                                .min_size(Vec2::new(90.0, 22.0))
+                            ).clicked() {
+                                if let Some(ref session_id) = sid {
+                                    if let Some(session) = self.sessions.get(session_id) {
+                                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                                            if let Ok(text) = cb.get_text() {
+                                                session.write_input(text.as_bytes());
+                                            }
+                                        }
+                                    }
+                                }
+                                close_ctx_menu = true;
+                            }
+                        });
+                });
+
+            // Close menu when clicking outside
+            let menu_rect = inner.response.rect;
+            let clicked_outside = ctx.input(|i| {
+                (i.pointer.primary_pressed() || i.pointer.secondary_pressed())
+                    && i.pointer.interact_pos().map_or(true, |p| !menu_rect.contains(p))
+            });
+            if clicked_outside { close_ctx_menu = true; }
+        }
+        if close_ctx_menu { self.context_menu = None; }
 
         // --- Confirm-close dialog ---
         if let Some(ref close_id) = self.confirm_close_id.clone() {
@@ -928,6 +1374,21 @@ fn setup_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+fn settings_section(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        RichText::new(title)
+            .font(FontId::new(10.0, FontFamily::Monospace))
+            .color(ACCENT),
+    );
+    ui.add_space(6.0);
+}
+
+fn settings_label(text: &str) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(11.0, FontFamily::Monospace))
+        .color(TEXT_DIM)
+}
+
 fn toolbar_btn(ui: &mut egui::Ui, label: &str, color: Color32) -> egui::Response {
     ui.add(
         egui::Button::new(
@@ -1003,6 +1464,23 @@ fn state_path() -> Option<std::path::PathBuf> {
     let dir = std::path::PathBuf::from(std::env::var("APPDATA").ok()?).join("multi-cli");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("state.json"))
+}
+
+fn settings_path() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var("APPDATA").ok()?).join("multi-cli");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("settings.json"))
+}
+
+fn load_settings_from_disk() -> AppSettings {
+    if let Some(path) = settings_path() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(s) = serde_json::from_str::<AppSettings>(&data) {
+                return s;
+            }
+        }
+    }
+    AppSettings::default()
 }
 
 #[cfg(test)]
