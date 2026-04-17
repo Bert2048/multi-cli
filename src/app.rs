@@ -23,6 +23,15 @@ const TITLEBAR_H: f32 = 28.0;
 const TOOLBAR_H: f32 = 40.0;
 const STATUS_H: f32 = 18.0;
 
+/// One Claude user profile — maps a display name to a home directory.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ClaudeUser {
+    /// Display name shown in the toolbar user-selector and settings list.
+    pub name: String,
+    /// Home directory for this user (HOME / USERPROFILE / CLAUDE_CONFIG_DIR base).
+    pub home_dir: String,
+}
+
 /// Persisted user preferences, saved to `%APPDATA%/multi-cli/settings.json`.
 /// One entry in the user-defined custom shell list.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -36,6 +45,9 @@ pub struct CustomShellConfig {
     /// Command sent silently to the PTY at session start.
     pub startup_cmd: String,
 }
+
+fn default_token_5h_limit() -> u64 { 2_350_000 }
+fn default_token_week_limit() -> u64 { 120_000_000 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -62,6 +74,18 @@ pub struct AppSettings {
     /// User-defined custom shell entries shown in the toolbar.
     #[serde(default)]
     pub custom_shells: Vec<CustomShellConfig>,
+    /// Named Claude user profiles (HOME directory per user).
+    #[serde(default)]
+    pub claude_users: Vec<ClaudeUser>,
+    /// Index into `claude_users` for the currently selected user.
+    #[serde(default)]
+    pub selected_claude_user: usize,
+    /// Token budget for the rolling 5-hour window (0 = show raw count).
+    #[serde(default = "default_token_5h_limit")]
+    pub token_5h_limit: u64,
+    /// Token budget for the rolling 7-day window (0 = show raw count).
+    #[serde(default = "default_token_week_limit")]
+    pub token_week_limit: u64,
 }
 
 impl Default for AppSettings {
@@ -69,7 +93,7 @@ impl Default for AppSettings {
         Self {
             font_size: 12.0,
             line_height_scale: 14.0 / 12.0, // ≈ 1.167
-            default_shell: ShellKind::PowerShell,
+            default_shell: ShellKind::Claude,
             pty_cols: 120,
             pty_rows: 40,
             sidebar_width: 160.0,
@@ -77,6 +101,10 @@ impl Default for AppSettings {
             claude_skip_permissions: false,
             claude_telegram: false,
             custom_shells: Vec::new(),
+            claude_users: vec![ClaudeUser { name: "Default".to_string(), home_dir: String::new() }],
+            selected_claude_user: 0,
+            token_5h_limit: 2_350_000,
+            token_week_limit: 120_000_000,
         }
     }
 }
@@ -112,6 +140,10 @@ pub struct MultiCliApp {
     pending_relaunch: Option<PendingRelaunch>,
     /// Last known working directory per session (Claude/Custom overwrite the OSC 2 title).
     session_dirs: HashMap<String, String>,
+    /// Which claude_users index each session was spawned with (session_id → user_idx).
+    session_user_idx: HashMap<String, usize>,
+    /// Per-home-dir token caches; keyed by resolved home path.
+    token_caches: HashMap<String, TokenCache>,
 }
 
 struct DragState {
@@ -137,6 +169,30 @@ struct PendingRelaunch {
     dir: String,
     claude_cmd: String,
     fire_at: std::time::Instant,
+}
+
+/// Cached Claude token-usage stats.
+/// Token usage aggregated from local JSONL transcripts.
+struct TokenCache {
+    tokens_5h: u64,
+    tokens_week: u64,
+    /// Timestamp of oldest entry in 5h window — used to estimate reset time.
+    oldest_5h: Option<u64>,
+    /// Timestamp of oldest entry in 7d window — used to estimate reset time.
+    oldest_week: Option<u64>,
+    last_scan: std::time::Instant,
+}
+
+impl Default for TokenCache {
+    fn default() -> Self {
+        Self {
+            tokens_5h: 0, tokens_week: 0,
+            oldest_5h: None, oldest_week: None,
+            last_scan: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(15))
+                .unwrap_or_else(std::time::Instant::now),
+        }
+    }
 }
 
 impl ResizeEdges {
@@ -199,8 +255,17 @@ impl MultiCliApp {
             dir_change_dialog: None,
             pending_relaunch: None,
             session_dirs: HashMap::new(),
+            session_user_idx: HashMap::new(),
+            token_caches: HashMap::new(),
         };
         app.load_state_or_default();
+        // Guarantee the Default user is always first so old saves still have it.
+        if app.settings.claude_users.is_empty() {
+            app.settings.claude_users.insert(0, ClaudeUser {
+                name: "Default".to_string(),
+                home_dir: String::new(),
+            });
+        }
         app
     }
 
@@ -261,13 +326,28 @@ impl MultiCliApp {
             }
             _ => None,
         };
+        let is_claude = matches!(&kind, ShellKind::Claude);
+        let claude_user_idx = if is_claude {
+            self.settings.selected_claude_user
+                .min(self.settings.claude_users.len().saturating_sub(1))
+        } else { 0 };
+        let user_home = if is_claude && claude_user_idx > 0 {
+            self.settings.claude_users.get(claude_user_idx)
+                .filter(|u| !u.home_dir.is_empty())
+                .map(|u| u.home_dir.clone())
+        } else {
+            None
+        };
         let tracked_dir = initial_dir.clone();
         let session = ShellSession::new(
             kind,
             self.settings.pty_cols, self.settings.pty_rows, initial_dir,
-            startup_cmd,
+            startup_cmd, user_home,
         );
         self.sessions.insert(id.clone(), session);
+        if is_claude {
+            self.session_user_idx.insert(id.clone(), claude_user_idx);
+        }
         if let Some(dir) = tracked_dir {
             self.session_dirs.insert(id.clone(), dir);
         }
@@ -295,6 +375,7 @@ impl MultiCliApp {
             serde_json::json!({
                 "name": w.title,
                 "kind": kind_str,
+                "user_idx": self.session_user_idx.get(&w.session_id).copied().unwrap_or(0),
                 "pos_x": w.pos.x,
                 "pos_y": w.pos.y,
                 "width": w.size.x,
@@ -344,12 +425,26 @@ impl MultiCliApp {
                             let last_dir: Option<String> = w["last_dir"].as_str()
                                 .filter(|s| !s.is_empty())
                                 .map(|s| s.to_string());
-                            // Claude and Custom shells always start at their configured
-                            // initial directory, not the last working directory.
+                            // Resolve saved user index before computing restore_dir so
+                            // custom-user Claude sessions can use their own home directory.
+                            let saved_user_idx = w["user_idx"].as_u64().unwrap_or(0) as usize;
+                            let saved_user_idx_clamped = saved_user_idx
+                                .min(self.settings.claude_users.len().saturating_sub(1));
                             let restore_dir = match &kind {
                                 ShellKind::Claude => {
-                                    if self.settings.claude_initial_dir.is_empty() { None }
-                                    else { Some(self.settings.claude_initial_dir.clone()) }
+                                    if saved_user_idx_clamped > 0 {
+                                        // Custom user: restore last dir, then fall back to
+                                        // global initial dir. home_dir is only for env vars,
+                                        // not the working directory.
+                                        last_dir.or_else(|| {
+                                            if self.settings.claude_initial_dir.is_empty() { None }
+                                            else { Some(self.settings.claude_initial_dir.clone()) }
+                                        })
+                                    } else {
+                                        // Default user: global initial dir
+                                        if self.settings.claude_initial_dir.is_empty() { None }
+                                        else { Some(self.settings.claude_initial_dir.clone()) }
+                                    }
                                 }
                                 ShellKind::Custom(exe) => {
                                     self.settings.custom_shells.iter()
@@ -358,6 +453,10 @@ impl MultiCliApp {
                                 }
                                 _ => last_dir,
                             };
+                            // Temporarily set selected_claude_user to the saved value so
+                            // spawn_shell_ex sets HOME/USERPROFILE/CLAUDE_CONFIG_DIR correctly.
+                            let prev_user = self.settings.selected_claude_user;
+                            self.settings.selected_claude_user = saved_user_idx_clamped;
                             self.spawn_shell_ex(
                                 kind,
                                 Some(name),
@@ -365,6 +464,7 @@ impl MultiCliApp {
                                 Some(egui::Pos2::new(pos_x, pos_y)),
                                 Some(egui::Vec2::new(width, height)),
                             );
+                            self.settings.selected_claude_user = prev_user;
                         }
                         if let Some(idx) = focused_idx {
                             if let Some(win) = self.wm.windows.get(idx) {
@@ -462,6 +562,10 @@ impl MultiCliApp {
                             .selected_text(default_shell_label)
                             .width(150.0)
                             .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.default_shell,
+                                    ShellKind::Claude, "Claude",
+                                );
                                 for c in &self.settings.custom_shells {
                                     if c.cmd.is_empty() { continue; }
                                     let label = if c.name.is_empty() { c.cmd.clone() } else { c.name.clone() };
@@ -481,10 +585,6 @@ impl MultiCliApp {
                                 ui.selectable_value(
                                     &mut self.settings.default_shell,
                                     ShellKind::Bash, "Bash",
-                                );
-                                ui.selectable_value(
-                                    &mut self.settings.default_shell,
-                                    ShellKind::Claude, "Claude",
                                 );
                             });
                         ui.end_row();
@@ -529,7 +629,161 @@ impl MultiCliApp {
                         ui.label(settings_label("Telegram"));
                         ui.checkbox(&mut self.settings.claude_telegram, "");
                         ui.end_row();
+
+                        ui.label(settings_label("5h Token Limit"));
+                        let mut h5_str = if self.settings.token_5h_limit == 0 {
+                            String::new()
+                        } else {
+                            self.settings.token_5h_limit.to_string()
+                        };
+                        if ui.add(
+                            egui::TextEdit::singleline(&mut h5_str)
+                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                .desired_width(100.0)
+                                .hint_text("0 = show raw"),
+                        ).changed() {
+                            self.settings.token_5h_limit = h5_str.trim().parse().unwrap_or(0);
+                        }
+                        ui.end_row();
+
+                        ui.label(settings_label("7d Token Limit"));
+                        let mut wk_str = if self.settings.token_week_limit == 0 {
+                            String::new()
+                        } else {
+                            self.settings.token_week_limit.to_string()
+                        };
+                        if ui.add(
+                            egui::TextEdit::singleline(&mut wk_str)
+                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                .desired_width(100.0)
+                                .hint_text("0 = show raw"),
+                        ).changed() {
+                            self.settings.token_week_limit = wk_str.trim().parse().unwrap_or(0);
+                        }
+                        ui.end_row();
                     });
+
+                ui.add_space(10.0);
+
+                // ── CLAUDE USERS ──────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("USERS")
+                            .font(FontId::new(10.0, FontFamily::Monospace))
+                            .color(TEXT_DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new("+ Add")
+                                    .font(FontId::new(10.0, FontFamily::Monospace))
+                                    .color(ACCENT),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(0.6, ACCENT.linear_multiply(0.5)))
+                            .min_size(Vec2::new(50.0, 18.0)),
+                        ).clicked() {
+                            self.settings.claude_users.push(ClaudeUser::default());
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new("  Set HOME / USERPROFILE / CLAUDE_CONFIG_DIR per user")
+                        .font(FontId::new(10.0, FontFamily::Monospace))
+                        .color(TEXT_DIM),
+                );
+                ui.add_space(4.0);
+
+                let mut remove_user_idx: Option<usize> = None;
+                for (i, user) in self.settings.claude_users.iter_mut().enumerate() {
+                    let is_default = i == 0;
+                    egui::Frame::none()
+                        .fill(SURFACE2)
+                        .stroke(Stroke::new(0.5, BORDER))
+                        .rounding(Rounding::same(3.0))
+                        .inner_margin(egui::Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if is_default { "Default".to_string() } else { format!("User {}", i) })
+                                        .font(FontId::new(10.0, FontFamily::Monospace))
+                                        .color(TEXT_DIM),
+                                );
+                                if !is_default {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.add(
+                                            egui::Button::new(
+                                                RichText::new("✕")
+                                                    .font(FontId::new(10.0, FontFamily::Monospace))
+                                                    .color(RED),
+                                            )
+                                            .fill(Color32::TRANSPARENT)
+                                            .frame(false),
+                                        ).clicked() {
+                                            remove_user_idx = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                            if is_default {
+                                // Default user: name is fixed; home_dir editable for token-scan only
+                                // (HOME env var is never overridden for idx 0 when spawning PTY).
+                                egui::Grid::new("s_user_default")
+                                    .num_columns(2)
+                                    .spacing([8.0, 4.0])
+                                    .min_col_width(80.0)
+                                    .show(ui, |ui| {
+                                        ui.label(settings_label("Name"));
+                                        ui.label(
+                                            RichText::new("Default")
+                                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                                .color(TEXT_DIM),
+                                        );
+                                        ui.end_row();
+                                        ui.label(settings_label("Stats Home"));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut user.home_dir)
+                                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                                .desired_width(200.0)
+                                                .hint_text(r"e.g. D:\home\bert  (token scan only)"),
+                                        );
+                                        ui.end_row();
+                                    });
+                            } else {
+                                egui::Grid::new(format!("s_user_{}", i))
+                                    .num_columns(2)
+                                    .spacing([8.0, 4.0])
+                                    .min_col_width(80.0)
+                                    .show(ui, |ui| {
+                                        ui.label(settings_label("Name"));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut user.name)
+                                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                                .desired_width(200.0)
+                                                .hint_text("display name"),
+                                        );
+                                        ui.end_row();
+                                        ui.label(settings_label("Home Dir"));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut user.home_dir)
+                                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                                .desired_width(200.0)
+                                                .hint_text(r"e.g. D:\home\alice"),
+                                        );
+                                        ui.end_row();
+                                    });
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+                if let Some(i) = remove_user_idx {
+                    self.settings.claude_users.remove(i);
+                    if self.settings.selected_claude_user >= self.settings.claude_users.len()
+                        && !self.settings.claude_users.is_empty()
+                    {
+                        self.settings.selected_claude_user = self.settings.claude_users.len() - 1;
+                    }
+                }
 
                 ui.add_space(14.0);
 
@@ -704,6 +958,108 @@ impl MultiCliApp {
     }
 }
 
+/// Parse an ISO-8601 UTC timestamp string into Unix seconds.
+/// Handles `"YYYY-MM-DDTHH:MM:SS..."` (trailing fractional seconds / offset ignored).
+fn parse_iso_to_unix(s: &str) -> u64 {
+    let b = s.as_bytes();
+    if b.len() < 19 { return 0; }
+    fn d(b: &[u8]) -> u64 { b.iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64) }
+    let (y, mo, day) = (d(&b[0..4]), d(&b[5..7]), d(&b[8..10]));
+    let (h, mi, sec) = (d(&b[11..13]), d(&b[14..16]), d(&b[17..19]));
+    // Howard Hinnant's civil-to-days → Unix epoch
+    let m  = if mo > 2 { mo } else { mo + 12 };
+    let y2 = if mo > 2 { y  } else { y - 1   };
+    let era = y2 / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * (m - 3) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146097 + doe) as i64 - 719_468;
+    if days < 0 { return 0; }
+    days as u64 * 86_400 + h * 3_600 + mi * 60 + sec
+}
+
+/// Format a token count compactly: `"1.2M"`, `"123k"`, or `"99"`.
+fn fmt_tok(n: u64) -> String {
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
+    else if n >= 1_000 { format!("{}k", n / 1_000) }
+    else               { n.to_string() }
+}
+
+/// Format a duration in seconds as `"2d03h"`, `"4h32m"`, `"12m05s"`, or `"0s"`.
+fn fmt_dur(secs: u64) -> String {
+    if secs >= 86_400 { format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3_600) }
+    else if secs >= 3_600 { format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60) }
+    else if secs >= 60    { format!("{}m{:02}s", secs / 60, secs % 60) }
+    else                  { format!("{}s", secs) }
+}
+
+
+/// Scan `{home}/.claude/projects/**/*.jsonl` and aggregate token usage for
+/// the rolling 5-hour and 7-day windows.
+///
+/// Follows the ccusage-rs approach:
+///   - walkdir recursive scan
+///   - only `type == "assistant"` lines
+///   - deduplicate by `message_id` (tool-call rounds repeat the same usage block)
+///   - sum input + output + cache_creation + cache_read tokens
+fn compute_token_stats(home: &str) -> TokenCache {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use walkdir::WalkDir;
+
+    let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let cut5h = now_s.saturating_sub(5 * 3_600);
+    let cut7d = now_s.saturating_sub(7 * 24 * 3_600);
+
+    let mut tok5 = 0u64;
+    let mut tok7 = 0u64;
+    let mut old5: Option<u64> = None;
+    let mut old7: Option<u64> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let proj_dir = format!("{}/.claude/projects", home);
+
+    for entry in WalkDir::new(&proj_dir).follow_links(false).into_iter().flatten() {
+        if !entry.file_type().is_file() { continue; }
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+        let Ok(file) = std::fs::File::open(entry.path()) else { continue };
+        for line in BufReader::new(file).lines().flatten() {
+            if !line.contains("\"assistant\"") || !line.contains("\"usage\"") { continue; }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            // Only assistant messages carry billable usage
+            if v.get("type").and_then(|x| x.as_str()) != Some("assistant") { continue; }
+            let ts_s = v.get("timestamp").and_then(|x| x.as_str())
+                        .map(parse_iso_to_unix).unwrap_or(0);
+            if ts_s == 0 || ts_s < cut7d { continue; }
+            // Deduplicate by message_id (parallel tool calls repeat the same block)
+            let msg_id = v.get("message").and_then(|m| m.get("id"))
+                          .and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if !msg_id.is_empty() && !seen.insert(msg_id) { continue; }
+            let Some(usage) = v.get("message").and_then(|m| m.get("usage")) else { continue };
+            // Count input + output + cache_write only.
+            // cache_read_input_tokens are cheap (10% cost) and NOT counted toward
+            // Claude's rate-limit windows (matches what /usage reports).
+            let tok =
+                usage.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
+                + usage.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
+                + usage.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            if tok == 0 { continue; }
+            tok7 += tok;
+            old7 = Some(old7.map(|o| o.min(ts_s)).unwrap_or(ts_s));
+            if ts_s >= cut5h {
+                tok5 += tok;
+                old5 = Some(old5.map(|o| o.min(ts_s)).unwrap_or(ts_s));
+            }
+        }
+    }
+
+    TokenCache {
+        tokens_5h: tok5, tokens_week: tok7, oldest_5h: old5, oldest_week: old7,
+        last_scan: std::time::Instant::now(),
+    }
+}
+
 fn extract_selection_text(
     lines: &[Vec<crate::terminal_buffer::TerminalCell>],
     start: (usize, usize),
@@ -736,6 +1092,32 @@ impl eframe::App for MultiCliApp {
         if self.last_save.elapsed() >= std::time::Duration::from_secs(60) {
             self.save_state();
             self.last_save = std::time::Instant::now();
+        }
+
+        // Refresh token stats every 10 seconds — one cache entry per distinct home dir
+        {
+            let sys_home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_default();
+            // Collect all unique home dirs referenced by active Claude sessions
+            let homes: std::collections::HashSet<String> = self.wm.windows.iter()
+                .filter_map(|w| self.session_user_idx.get(&w.session_id).copied())
+                .map(|idx| {
+                    let idx = idx.min(self.settings.claude_users.len().saturating_sub(1));
+                    let cfg = self.settings.claude_users.get(idx)
+                        .map(|u| u.home_dir.as_str()).unwrap_or("");
+                    if cfg.is_empty() { sys_home.clone() } else { cfg.to_string() }
+                })
+                .filter(|h| !h.is_empty())
+                .collect();
+            for home in homes {
+                let stale = self.token_caches.get(&home)
+                    .map(|c| c.last_scan.elapsed() >= std::time::Duration::from_secs(10))
+                    .unwrap_or(true);
+                if stale {
+                    self.token_caches.insert(home.clone(), compute_token_stats(&home));
+                }
+            }
         }
 
         // Style
@@ -782,6 +1164,7 @@ impl eframe::App for MultiCliApp {
                         .selected_text(combo_label)
                         .width(110.0)
                         .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.new_shell_kind, ShellKind::Claude, "Claude");
                             for (cmd, label) in custom_entries {
                                 ui.selectable_value(
                                     &mut self.new_shell_kind,
@@ -792,8 +1175,54 @@ impl eframe::App for MultiCliApp {
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::PowerShell, "PowerShell");
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::Cmd, "CMD");
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::Bash, "Bash");
-                            ui.selectable_value(&mut self.new_shell_kind, ShellKind::Claude, "Claude");
                         });
+
+                    // User selector: only visible when 2 or more Claude users are configured
+                    // (index 0 is always the implicit Default; custom users start at index 1)
+                    if self.settings.claude_users.len() >= 2 {
+                        ui.add_space(4.0);
+                        if self.settings.selected_claude_user >= self.settings.claude_users.len() {
+                            self.settings.selected_claude_user = 0;
+                        }
+                        let user_label = if self.settings.selected_claude_user == 0 {
+                            "Default".to_string()
+                        } else {
+                            self.settings.claude_users
+                                .get(self.settings.selected_claude_user)
+                                .map(|u| if u.name.is_empty() {
+                                    format!("User {}", self.settings.selected_claude_user)
+                                } else {
+                                    u.name.clone()
+                                })
+                                .unwrap_or_else(|| "Default".to_string())
+                        };
+                        egui::ComboBox::from_id_source("claude_user_combo")
+                            .selected_text(format!("👤 {}", user_label))
+                            .width(120.0)
+                            .show_ui(ui, |ui| {
+                                // Default is always first
+                                ui.selectable_value(
+                                    &mut self.settings.selected_claude_user,
+                                    0,
+                                    "Default",
+                                );
+                                // Custom users follow (index 1+)
+                                for i in 1..self.settings.claude_users.len() {
+                                    let label = self.settings.claude_users.get(i)
+                                        .map(|u| if u.name.is_empty() {
+                                            format!("User {}", i)
+                                        } else {
+                                            u.name.clone()
+                                        })
+                                        .unwrap_or_else(|| format!("User {}", i));
+                                    ui.selectable_value(
+                                        &mut self.settings.selected_claude_user,
+                                        i,
+                                        label,
+                                    );
+                                }
+                            });
+                    }
 
                     if toolbar_btn(ui, "+ NEW", ACCENT).clicked() {
                         self.spawn_shell(self.new_shell_kind.clone());
@@ -806,9 +1235,6 @@ impl eframe::App for MultiCliApp {
                     }
                     if toolbar_btn(ui, "CASCADE", TEXT_DIM).clicked() {
                         self.wm.cascade();
-                    }
-                    if toolbar_btn(ui, "FREE", TEXT_DIM).clicked() {
-                        self.wm.free();
                     }
 
                     ui.add_space(8.0);
@@ -1216,6 +1642,7 @@ impl eframe::App for MultiCliApp {
                         let t = buf.screen_title();
                         let shell_kind = self.sessions.get(&session_id).map(|s| s.kind.clone());
                         let is_managed = matches!(shell_kind.as_ref(), Some(ShellKind::Claude) | Some(ShellKind::Custom(_)));
+                        let is_claude = matches!(shell_kind.as_ref(), Some(ShellKind::Claude));
                         let cwd = if is_managed {
                             // Claude CLI overwrites title to "Claude Code"; use our tracked dir.
                             self.session_dirs.get(&session_id)
@@ -1224,6 +1651,8 @@ impl eframe::App for MultiCliApp {
                         } else {
                             if t.is_empty() { "~".to_string() } else { t }
                         };
+
+                        // Left: current working directory
                         painter.text(
                             Pos2::new(status_rect.min.x + 6.0, status_rect.center().y),
                             egui::Align2::LEFT_CENTER,
@@ -1231,6 +1660,69 @@ impl eframe::App for MultiCliApp {
                             FontId::new(10.0, FontFamily::Monospace),
                             TEXT_DIM,
                         );
+
+                        // Right (Claude only): user | 5h token% | reset | 7d token% | reset
+                        if is_claude {
+                            // Resolve which user/home this session belongs to
+                            let sys_home = std::env::var("USERPROFILE")
+                                .or_else(|_| std::env::var("HOME"))
+                                .unwrap_or_default();
+                            let user_idx = self.session_user_idx.get(&session_id).copied()
+                                .unwrap_or(0)
+                                .min(self.settings.claude_users.len().saturating_sub(1));
+                            let user_home = {
+                                let cfg = self.settings.claude_users.get(user_idx)
+                                    .map(|u| u.home_dir.as_str()).unwrap_or("");
+                                if cfg.is_empty() { sys_home } else { cfg.to_string() }
+                            };
+                            let user_name = if user_idx == 0 {
+                                "Default".to_string()
+                            } else {
+                                self.settings.claude_users.get(user_idx)
+                                    .map(|u| if u.name.is_empty() { format!("User {}", user_idx) } else { u.name.clone() })
+                                    .unwrap_or_else(|| "Default".to_string())
+                            };
+                            let cache = self.token_caches.get(&user_home);
+                            let now_s = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            // 5h usage % from JSONL counts / configured limit
+                            let h5_usage = if self.settings.token_5h_limit > 0 {
+                                let pct = (cache.map(|c| c.tokens_5h).unwrap_or(0) * 100)
+                                    / self.settings.token_5h_limit.max(1);
+                                format!("{}%", pct)
+                            } else {
+                                fmt_tok(cache.map(|c| c.tokens_5h).unwrap_or(0))
+                            };
+                            // 5h reset: rolling window from oldest entry
+                            let h5_reset = cache.and_then(|c| c.oldest_5h)
+                                .map(|o| fmt_dur((o + 5 * 3_600).saturating_sub(now_s)))
+                                .unwrap_or_else(|| "--".to_string());
+                            // 7d usage % from JSONL counts / configured limit
+                            let wk_usage = if self.settings.token_week_limit > 0 {
+                                let pct = (cache.map(|c| c.tokens_week).unwrap_or(0) * 100)
+                                    / self.settings.token_week_limit.max(1);
+                                format!("{}%", pct)
+                            } else {
+                                fmt_tok(cache.map(|c| c.tokens_week).unwrap_or(0))
+                            };
+                            // 7d reset: rolling window from oldest entry
+                            let wk_reset = cache.and_then(|c| c.oldest_week)
+                                .map(|o| fmt_dur((o + 7 * 24 * 3_600).saturating_sub(now_s)))
+                                .unwrap_or_else(|| "--".to_string());
+                            // Format: user | 5h:XX% | 3h41m | 7d:XX% | 6d17h
+                            let right_text = format!(
+                                "{} \u{2502} 5h:{} \u{2502} {} \u{2502} 7d:{} \u{2502} {}",
+                                user_name, h5_usage, h5_reset, wk_usage, wk_reset
+                            );
+                            painter.text(
+                                Pos2::new(status_rect.max.x - 6.0, status_rect.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                &right_text,
+                                FontId::new(10.0, FontFamily::Monospace),
+                                TEXT_DIM,
+                            );
+                        }
 
                         // Double-click on status bar → dir change dialog
                         if pointer_dbl {
@@ -1880,7 +2372,10 @@ fn settings_path() -> Option<std::path::PathBuf> {
 fn load_settings_from_disk() -> AppSettings {
     if let Some(path) = settings_path() {
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(s) = serde_json::from_str::<AppSettings>(&data) {
+            if let Ok(mut s) = serde_json::from_str::<AppSettings>(&data) {
+                // Migrate zero limits from old saves — 0 means "not configured yet".
+                if s.token_5h_limit == 0 { s.token_5h_limit = default_token_5h_limit(); }
+                if s.token_week_limit == 0 { s.token_week_limit = default_token_week_limit(); }
                 return s;
             }
         }

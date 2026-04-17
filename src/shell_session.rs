@@ -121,6 +121,7 @@ impl ShellSession {
         rows: u16,
         initial_dir: Option<String>,
         startup_cmd: Option<String>,
+        user_home: Option<String>,
     ) -> Self {
         let buffer = Arc::new(Mutex::new(TerminalBuffer::new(cols as usize, rows as usize)));
         let (input_tx, input_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(256);
@@ -172,7 +173,12 @@ impl ShellSession {
 
         let buf_clone = buffer.clone();
         let alive_clone = alive.clone();
-        let cmd = kind.build_command(initial_dir.as_deref(), startup_cmd.as_deref());
+        let mut cmd = kind.build_command(initial_dir.as_deref(), startup_cmd.as_deref());
+        if let Some(ref home) = user_home {
+            cmd.env("HOME", home);
+            cmd.env("USERPROFILE", home);
+            cmd.env("CLAUDE_CONFIG_DIR", format!("{}\\.claude", home));
+        }
 
         thread::spawn(move || {
             let pty_system = native_pty_system();

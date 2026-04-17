@@ -131,10 +131,6 @@ impl WindowManager {
         self.apply_layout();
     }
 
-    pub fn free(&mut self) {
-        self.layout_mode = LayoutMode::Free;
-    }
-
     pub fn apply_layout(&mut self) {
         let visible: Vec<usize> = self
             .windows
@@ -349,14 +345,6 @@ mod tests {
     }
 
     // ── layouts ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn free_sets_layout_mode() {
-        let mut wm = make_wm();
-        wm.tile();
-        wm.free();
-        assert_eq!(wm.layout_mode, LayoutMode::Free);
-    }
 
     #[test]
     fn tile_sets_mode_and_assigns_equal_sizes() {

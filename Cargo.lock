@@ -2096,6 +2096,7 @@ dependencies = [
  "serde_json",
  "uuid",
  "vt100",
+ "walkdir",
 ]
 
 [[package]]
