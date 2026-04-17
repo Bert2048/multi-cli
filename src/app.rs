@@ -24,6 +24,19 @@ const TOOLBAR_H: f32 = 40.0;
 const STATUS_H: f32 = 18.0;
 
 /// Persisted user preferences, saved to `%APPDATA%/multi-cli/settings.json`.
+/// One entry in the user-defined custom shell list.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CustomShellConfig {
+    /// Label shown in the toolbar dropdown.
+    pub name: String,
+    /// Executable path or command (empty = entry hidden from toolbar).
+    pub cmd: String,
+    /// Initial working directory (empty = OS default).
+    pub dir: String,
+    /// Command sent silently to the PTY at session start.
+    pub startup_cmd: String,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
     /// Terminal font size in pixels (range 8–24).
@@ -38,6 +51,17 @@ pub struct AppSettings {
     pub pty_rows: u16,
     /// Sidebar panel width in pixels.
     pub sidebar_width: f32,
+    /// Initial working directory for new Claude sessions (empty = OS default).
+    pub claude_initial_dir: String,
+    /// Pass --dangerously-skip-permissions when launching claude.
+    #[serde(default)]
+    pub claude_skip_permissions: bool,
+    /// Add Telegram MCP plugin when launching claude.
+    #[serde(default)]
+    pub claude_telegram: bool,
+    /// User-defined custom shell entries shown in the toolbar.
+    #[serde(default)]
+    pub custom_shells: Vec<CustomShellConfig>,
 }
 
 impl Default for AppSettings {
@@ -49,6 +73,10 @@ impl Default for AppSettings {
             pty_cols: 120,
             pty_rows: 40,
             sidebar_width: 160.0,
+            claude_initial_dir: String::new(),
+            claude_skip_permissions: false,
+            claude_telegram: false,
+            custom_shells: Vec::new(),
         }
     }
 }
@@ -80,6 +108,10 @@ pub struct MultiCliApp {
     context_menu: Option<(Pos2, String)>, // (screen_pos, window_id)
     settings: AppSettings,
     show_settings: bool,
+    dir_change_dialog: Option<DirChangeDialog>,
+    pending_relaunch: Option<PendingRelaunch>,
+    /// Last known working directory per session (Claude/Custom overwrite the OSC 2 title).
+    session_dirs: HashMap<String, String>,
 }
 
 struct DragState {
@@ -93,6 +125,18 @@ struct ResizeEdges {
     right: bool,
     top: bool,
     bottom: bool,
+}
+
+struct DirChangeDialog {
+    session_id: String,
+    new_dir: String,
+}
+
+struct PendingRelaunch {
+    session_id: String,
+    dir: String,
+    claude_cmd: String,
+    fire_at: std::time::Instant,
 }
 
 impl ResizeEdges {
@@ -152,6 +196,9 @@ impl MultiCliApp {
             context_menu: None,
             settings,
             show_settings: false,
+            dir_change_dialog: None,
+            pending_relaunch: None,
+            session_dirs: HashMap::new(),
         };
         app.load_state_or_default();
         app
@@ -166,7 +213,23 @@ impl MultiCliApp {
     }
 
     fn spawn_shell(&mut self, kind: ShellKind) {
-        self.spawn_shell_ex(kind, None, None, None, None);
+        let (name, initial_dir) = match &kind {
+            ShellKind::Claude => {
+                let dir = if self.settings.claude_initial_dir.is_empty() { None }
+                          else { Some(self.settings.claude_initial_dir.clone()) };
+                (None, dir)
+            }
+            ShellKind::Custom(exe) => {
+                let cfg = self.settings.custom_shells.iter()
+                    .find(|c| &c.cmd == exe)
+                    .cloned();
+                let name = cfg.as_ref().and_then(|c| if c.name.is_empty() { None } else { Some(c.name.clone()) });
+                let dir  = cfg.as_ref().and_then(|c| if c.dir.is_empty()  { None } else { Some(c.dir.clone())  });
+                (name, dir)
+            }
+            _ => (None, None),
+        };
+        self.spawn_shell_ex(kind, name, initial_dir, None, None);
     }
 
     fn spawn_shell_ex(
@@ -180,11 +243,34 @@ impl MultiCliApp {
         self.session_counter += 1;
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("{} {}", kind.label(), self.session_counter));
+        let startup_cmd = match &kind {
+            ShellKind::Custom(exe) => {
+                self.settings.custom_shells.iter()
+                    .find(|c| &c.cmd == exe)
+                    .and_then(|c| if c.startup_cmd.is_empty() { None } else { Some(c.startup_cmd.clone()) })
+            }
+            ShellKind::Claude => {
+                let mut cmd = String::from("claude");
+                if self.settings.claude_skip_permissions {
+                    cmd.push_str(" --dangerously-skip-permissions");
+                }
+                if self.settings.claude_telegram {
+                    cmd.push_str(" --channels plugin:telegram@claude-plugins-official");
+                }
+                Some(cmd)
+            }
+            _ => None,
+        };
+        let tracked_dir = initial_dir.clone();
         let session = ShellSession::new(
             kind,
             self.settings.pty_cols, self.settings.pty_rows, initial_dir,
+            startup_cmd,
         );
         self.sessions.insert(id.clone(), session);
+        if let Some(dir) = tracked_dir {
+            self.session_dirs.insert(id.clone(), dir);
+        }
         let win_id = self.wm.add_window(id, name);
         if let (Some(p), Some(s)) = (pos, size) {
             if let Some(w) = self.wm.windows.iter_mut().find(|w| w.id == win_id) {
@@ -201,7 +287,10 @@ impl MultiCliApp {
                 .map(|b| b.screen_title())
                 .unwrap_or_default();
             let kind_str = self.sessions.get(&w.session_id)
-                .map(|s| s.kind.label().to_string())
+                .map(|s| match &s.kind {
+                    ShellKind::Custom(exe) => format!("Custom:{}", exe),
+                    k => k.label().to_string(),
+                })
                 .unwrap_or_else(|| "PowerShell".to_string());
             serde_json::json!({
                 "name": w.title,
@@ -237,10 +326,16 @@ impl MultiCliApp {
                                 focused_idx = Some(idx);
                             }
                             let name = w["name"].as_str().unwrap_or("Shell").to_string();
-                            let kind = match w["kind"].as_str().unwrap_or("PowerShell") {
-                                "CMD" | "Cmd" => ShellKind::Cmd,
-                                "Bash" => ShellKind::Bash,
-                                _ => ShellKind::PowerShell,
+                            let kind_raw = w["kind"].as_str().unwrap_or("PowerShell");
+                            let kind = if let Some(exe) = kind_raw.strip_prefix("Custom:") {
+                                ShellKind::Custom(exe.to_string())
+                            } else {
+                                match kind_raw {
+                                    "CMD" | "Cmd" => ShellKind::Cmd,
+                                    "Bash" => ShellKind::Bash,
+                                    "Claude" => ShellKind::Claude,
+                                    _ => ShellKind::PowerShell,
+                                }
                             };
                             let pos_x = w["pos_x"].as_f64().unwrap_or(160.0) as f32;
                             let pos_y = w["pos_y"].as_f64().unwrap_or(40.0) as f32;
@@ -249,10 +344,24 @@ impl MultiCliApp {
                             let last_dir: Option<String> = w["last_dir"].as_str()
                                 .filter(|s| !s.is_empty())
                                 .map(|s| s.to_string());
+                            // Claude and Custom shells always start at their configured
+                            // initial directory, not the last working directory.
+                            let restore_dir = match &kind {
+                                ShellKind::Claude => {
+                                    if self.settings.claude_initial_dir.is_empty() { None }
+                                    else { Some(self.settings.claude_initial_dir.clone()) }
+                                }
+                                ShellKind::Custom(exe) => {
+                                    self.settings.custom_shells.iter()
+                                        .find(|c| &c.cmd == exe)
+                                        .and_then(|c| if c.dir.is_empty() { None } else { Some(c.dir.clone()) })
+                                }
+                                _ => last_dir,
+                            };
                             self.spawn_shell_ex(
                                 kind,
                                 Some(name),
-                                last_dir,
+                                restore_dir,
                                 Some(egui::Pos2::new(pos_x, pos_y)),
                                 Some(egui::Vec2::new(width, height)),
                             );
@@ -342,10 +451,25 @@ impl MultiCliApp {
                     .min_col_width(110.0)
                     .show(ui, |ui| {
                         ui.label(settings_label("Default Shell"));
+                        let default_shell_label = match &self.settings.default_shell {
+                            ShellKind::Custom(exe) => self.settings.custom_shells.iter()
+                                .find(|c| &c.cmd == exe)
+                                .and_then(|c| if c.name.is_empty() { None } else { Some(c.name.clone()) })
+                                .unwrap_or_else(|| exe.clone()),
+                            k => k.label().to_string(),
+                        };
                         egui::ComboBox::from_id_source("settings_shell_combo")
-                            .selected_text(self.settings.default_shell.label())
+                            .selected_text(default_shell_label)
                             .width(150.0)
                             .show_ui(ui, |ui| {
+                                for c in &self.settings.custom_shells {
+                                    if c.cmd.is_empty() { continue; }
+                                    let label = if c.name.is_empty() { c.cmd.clone() } else { c.name.clone() };
+                                    ui.selectable_value(
+                                        &mut self.settings.default_shell,
+                                        ShellKind::Custom(c.cmd.clone()), label,
+                                    );
+                                }
                                 ui.selectable_value(
                                     &mut self.settings.default_shell,
                                     ShellKind::PowerShell, "PowerShell",
@@ -357,6 +481,10 @@ impl MultiCliApp {
                                 ui.selectable_value(
                                     &mut self.settings.default_shell,
                                     ShellKind::Bash, "Bash",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.default_shell,
+                                    ShellKind::Claude, "Claude",
                                 );
                             });
                         ui.end_row();
@@ -375,6 +503,133 @@ impl MultiCliApp {
                         );
                         ui.end_row();
                     });
+
+                ui.add_space(14.0);
+
+                // ── CLAUDE ────────────────────────────────────────────────
+                settings_section(ui, "CLAUDE");
+                egui::Grid::new("s_claude")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .min_col_width(110.0)
+                    .show(ui, |ui| {
+                        ui.label(settings_label("Directory"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.claude_initial_dir)
+                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                .desired_width(150.0)
+                                .hint_text("default working dir"),
+                        );
+                        ui.end_row();
+
+                        ui.label(settings_label("Skip Permissions"));
+                        ui.checkbox(&mut self.settings.claude_skip_permissions, "");
+                        ui.end_row();
+
+                        ui.label(settings_label("Telegram"));
+                        ui.checkbox(&mut self.settings.claude_telegram, "");
+                        ui.end_row();
+                    });
+
+                ui.add_space(14.0);
+
+                // ── CUSTOM SHELLS ─────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    settings_section(ui, "CUSTOM SHELLS");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new("+ Add")
+                                    .font(FontId::new(10.0, FontFamily::Monospace))
+                                    .color(ACCENT),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(0.6, ACCENT.linear_multiply(0.5)))
+                            .min_size(Vec2::new(50.0, 18.0)),
+                        ).clicked() {
+                            self.settings.custom_shells.push(CustomShellConfig::default());
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new("  Shown in toolbar when Command is non-empty")
+                        .font(FontId::new(10.0, FontFamily::Monospace))
+                        .color(TEXT_DIM),
+                );
+                ui.add_space(4.0);
+
+                let mut remove_idx: Option<usize> = None;
+                for (i, entry) in self.settings.custom_shells.iter_mut().enumerate() {
+                    egui::Frame::none()
+                        .fill(SURFACE2)
+                        .stroke(Stroke::new(0.5, BORDER))
+                        .rounding(Rounding::same(3.0))
+                        .inner_margin(egui::Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Entry {}", i + 1))
+                                        .font(FontId::new(10.0, FontFamily::Monospace))
+                                        .color(TEXT_DIM),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.add(
+                                        egui::Button::new(
+                                            RichText::new("✕")
+                                                .font(FontId::new(10.0, FontFamily::Monospace))
+                                                .color(RED),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .frame(false),
+                                    ).clicked() {
+                                        remove_idx = Some(i);
+                                    }
+                                });
+                            });
+                            egui::Grid::new(format!("s_custom_{}", i))
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .min_col_width(80.0)
+                                .show(ui, |ui| {
+                                    ui.label(settings_label("Name"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut entry.name)
+                                            .font(FontId::new(11.0, FontFamily::Monospace))
+                                            .desired_width(200.0)
+                                            .hint_text("display name"),
+                                    );
+                                    ui.end_row();
+                                    ui.label(settings_label("Command"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut entry.cmd)
+                                            .font(FontId::new(11.0, FontFamily::Monospace))
+                                            .desired_width(200.0)
+                                            .hint_text("e.g. wsl.exe"),
+                                    );
+                                    ui.end_row();
+                                    ui.label(settings_label("Directory"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut entry.dir)
+                                            .font(FontId::new(11.0, FontFamily::Monospace))
+                                            .desired_width(200.0)
+                                            .hint_text("initial working dir"),
+                                    );
+                                    ui.end_row();
+                                    ui.label(settings_label("Startup Cmd"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut entry.startup_cmd)
+                                            .font(FontId::new(11.0, FontFamily::Monospace))
+                                            .desired_width(200.0)
+                                            .hint_text("run silently on open"),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+                    ui.add_space(4.0);
+                }
+                if let Some(i) = remove_idx {
+                    self.settings.custom_shells.remove(i);
+                }
 
                 ui.add_space(4.0);
                 ui.label(
@@ -510,13 +765,34 @@ impl eframe::App for MultiCliApp {
                     ui.add_space(16.0);
 
                     // shell kind selector
+                    let combo_label = match &self.new_shell_kind {
+                        ShellKind::Custom(exe) => {
+                            self.settings.custom_shells.iter()
+                                .find(|c| &c.cmd == exe)
+                                .and_then(|c| if c.name.is_empty() { None } else { Some(c.name.clone()) })
+                                .unwrap_or_else(|| exe.clone())
+                        }
+                        other => other.label().to_string(),
+                    };
+                    let custom_entries: Vec<(String, String)> = self.settings.custom_shells.iter()
+                        .filter(|c| !c.cmd.is_empty())
+                        .map(|c| (c.cmd.clone(), if c.name.is_empty() { c.cmd.clone() } else { c.name.clone() }))
+                        .collect();
                     egui::ComboBox::from_id_source("shell_kind")
-                        .selected_text(self.new_shell_kind.label())
+                        .selected_text(combo_label)
                         .width(110.0)
                         .show_ui(ui, |ui| {
+                            for (cmd, label) in custom_entries {
+                                ui.selectable_value(
+                                    &mut self.new_shell_kind,
+                                    ShellKind::Custom(cmd),
+                                    label,
+                                );
+                            }
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::PowerShell, "PowerShell");
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::Cmd, "CMD");
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::Bash, "Bash");
+                            ui.selectable_value(&mut self.new_shell_kind, ShellKind::Claude, "Claude");
                         });
 
                     if toolbar_btn(ui, "+ NEW", ACCENT).clicked() {
@@ -703,6 +979,7 @@ impl eframe::App for MultiCliApp {
                 let pointer_pressed = ctx.input(|i| i.pointer.primary_pressed());
                 let pointer_released = ctx.input(|i| i.pointer.primary_released());
                 let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+                let pointer_dbl = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
 
                 if pointer_released {
                     self.drag_state = None;
@@ -762,6 +1039,7 @@ impl eframe::App for MultiCliApp {
                 let mut sel_focus_update: Option<(String, usize, usize)> = None;
                 let mut start_sel_drag = false;
                 let mut new_context_menu: Option<(Pos2, String)> = None;
+                let mut dir_change_request: Option<(String, String)> = None; // (session_id, current_cwd)
 
                 for &wi in &sorted {
                     let win = &self.wm.windows[wi];
@@ -936,14 +1214,32 @@ impl eframe::App for MultiCliApp {
                             Stroke::new(0.5, BORDER),
                         );
                         let t = buf.screen_title();
-                        let cwd = if t.is_empty() { "~".to_string() } else { t };
+                        let shell_kind = self.sessions.get(&session_id).map(|s| s.kind.clone());
+                        let is_managed = matches!(shell_kind.as_ref(), Some(ShellKind::Claude) | Some(ShellKind::Custom(_)));
+                        let cwd = if is_managed {
+                            // Claude CLI overwrites title to "Claude Code"; use our tracked dir.
+                            self.session_dirs.get(&session_id)
+                                .cloned()
+                                .unwrap_or_else(|| if t.is_empty() { "~".to_string() } else { t })
+                        } else {
+                            if t.is_empty() { "~".to_string() } else { t }
+                        };
                         painter.text(
                             Pos2::new(status_rect.min.x + 6.0, status_rect.center().y),
                             egui::Align2::LEFT_CENTER,
-                            cwd,
+                            &cwd,
                             FontId::new(10.0, FontFamily::Monospace),
                             TEXT_DIM,
                         );
+
+                        // Double-click on status bar → dir change dialog
+                        if pointer_dbl {
+                            if let Some(mpos) = pointer_pos {
+                                if status_rect.contains(mpos) && is_managed {
+                                    dir_change_request = Some((session_id.clone(), cwd));
+                                }
+                            }
+                        }
                     }
 
                     // Crisp border drawn last — on top of all content
@@ -1010,6 +1306,7 @@ impl eframe::App for MultiCliApp {
                         if pointer_pressed && term_rect.contains(mpos)
                             && self.drag_state.is_none()
                             && self.resize_state.is_none()
+                            && self.context_menu.is_none()
                         {
                             let col = ((mpos.x - term_rect.min.x - 4.0).max(0.0) / char_w) as usize;
                             let vis_r = ((mpos.y - term_rect.min.y - 2.0).max(0.0) / line_h) as usize;
@@ -1075,10 +1372,13 @@ impl eframe::App for MultiCliApp {
                 }
                 if start_sel_drag { self.sel_dragging = true; }
                 if let Some(cm) = new_context_menu { self.context_menu = Some(cm); }
+                if let Some((sid, cwd)) = dir_change_request {
+                    self.dir_change_dialog = Some(DirChangeDialog { session_id: sid, new_dir: cwd });
+                }
 
                 // Keyboard input → direct PTY passthrough (shell-style)
-                // Skip when the rename input is active to avoid dual input
-                if self.renaming_id.is_none() {
+                // Skip when the rename input, settings, or dir dialog is active to avoid dual input
+                if self.renaming_id.is_none() && !self.show_settings && self.dir_change_dialog.is_none() {
                 if let Some(fid) = self.wm.focused_id.clone() {
                     let win_info = self.wm.windows.iter().find(|w| w.id == fid).map(|w| {
                         (w.session_id.clone(), w.pos, w.size)
@@ -1148,6 +1448,107 @@ impl eframe::App for MultiCliApp {
             self.show_settings = still_open;
         }
 
+        // --- Pending Claude relaunch (after /exit delay) ---
+        if let Some(ref relaunch) = self.pending_relaunch {
+            if std::time::Instant::now() >= relaunch.fire_at {
+                let sid = relaunch.session_id.clone();
+                let dir = relaunch.dir.clone();
+                let claude_cmd = relaunch.claude_cmd.clone();
+                if let Some(session) = self.sessions.get(&sid) {
+                    let ps_cmd = format!(
+                        "Set-Location '{}'; {}\r",
+                        dir.replace('\'', "''"),
+                        claude_cmd,
+                    );
+                    session.write_input(ps_cmd.as_bytes());
+                }
+                self.session_dirs.insert(sid, dir);
+                self.pending_relaunch = None;
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+
+        // --- Dir change dialog ---
+        let mut dir_confirmed = false;
+        let mut dir_cancelled = false;
+        if self.dir_change_dialog.is_some() {
+            egui::Window::new("Change Directory")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(SURFACE2)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .inner_margin(egui::Margin::same(16.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.style_mut().visuals.override_text_color = Some(TEXT);
+                    ui.label(settings_label("New Directory:"));
+                    ui.add_space(6.0);
+                    if let Some(dialog) = self.dir_change_dialog.as_mut() {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.new_dir)
+                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                .desired_width(300.0),
+                        );
+                        resp.request_focus();
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            dir_confirmed = true;
+                        }
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new("Cancel").font(FontId::new(11.0, FontFamily::Monospace)).color(TEXT_DIM)
+                            ).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.8, BORDER))
+                        ).clicked() {
+                            dir_cancelled = true;
+                        }
+                        ui.add_space(8.0);
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new("Confirm").font(FontId::new(11.0, FontFamily::Monospace)).color(ACCENT)
+                            ).fill(ACCENT.linear_multiply(0.15)).stroke(Stroke::new(0.8, ACCENT.linear_multiply(0.5)))
+                        ).clicked() {
+                            dir_confirmed = true;
+                        }
+                    });
+                });
+        }
+        if dir_cancelled { self.dir_change_dialog = None; }
+        if dir_confirmed {
+            if let Some(dialog) = self.dir_change_dialog.take() {
+                let kind = self.sessions.get(&dialog.session_id).map(|s| s.kind.clone());
+                if matches!(kind.as_ref(), Some(ShellKind::Claude)) {
+                    let mut claude_cmd = String::from("claude");
+                    if self.settings.claude_skip_permissions {
+                        claude_cmd.push_str(" --dangerously-skip-permissions");
+                    }
+                    if self.settings.claude_telegram {
+                        claude_cmd.push_str(" --channels plugin:telegram@claude-plugins-official");
+                    }
+                    if let Some(session) = self.sessions.get(&dialog.session_id) {
+                        session.write_input(b"/exit\r");
+                    }
+                    // Normalize drive-root paths: "G:" → "G:\" so Set-Location works correctly
+                    let new_dir = {
+                        let d = dialog.new_dir.trim_end_matches(['/', '\\']).to_string();
+                        if d.len() == 2 && d.as_bytes()[1] == b':' { format!("{}\\", d) } else { d }
+                    };
+                    self.pending_relaunch = Some(PendingRelaunch {
+                        session_id: dialog.session_id,
+                        dir: new_dir,
+                        claude_cmd,
+                        fire_at: std::time::Instant::now() + std::time::Duration::from_millis(1000),
+                    });
+                }
+            }
+        }
+
         // --- Context menu (right-click copy/paste) ---
         let mut close_ctx_menu = false;
         if let Some((menu_pos, ref menu_win_id)) = self.context_menu.clone() {
@@ -1186,7 +1587,9 @@ impl eframe::App for MultiCliApp {
                                                 let lines = buf.visible_lines();
                                                 let (sr, er) = sel.range();
                                                 let text = extract_selection_text(&lines, sr, er);
-                                                ctx.output_mut(|o| o.copied_text = text);
+                                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                                    let _ = cb.set_text(text);
+                                                }
                                             }
                                         }
                                     }
@@ -1306,8 +1709,8 @@ impl eframe::App for MultiCliApp {
     /// Called by eframe BEFORE egui processes events — intercept key events here
     /// so egui never sees Ctrl+C as "copy", Ctrl+Z as "undo", etc.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        // Don't intercept keys while the session rename input is active
-        if self.renaming_id.is_some() { return; }
+        // Don't intercept keys while the session rename input, settings, or dir dialog is active
+        if self.renaming_id.is_some() || self.show_settings || self.dir_change_dialog.is_some() { return; }
         // Only intercept when a terminal window is focused
         let sid = self.wm.focused_id.as_ref()
             .and_then(|fid| self.wm.windows.iter().find(|w| &w.id == fid))
@@ -1318,14 +1721,16 @@ impl eframe::App for MultiCliApp {
         let mut to_remove: Vec<usize> = Vec::new();
 
         for (i, event) in raw_input.events.iter().enumerate() {
-            if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
-                if let Some(bytes) = key_to_bytes(key, modifiers) {
-                    to_send.push(bytes.to_vec());
-                    // Remove so egui cannot also process the event
-                    to_remove.push(i);
-                }
-                // Keys without a mapping (e.g. Ctrl+N for "new window") are left
-                // in raw_input so update() can handle them normally.
+            let bytes: Option<&'static [u8]> = match event {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => key_to_bytes(key, modifiers),
+                // egui converts Ctrl+C → Event::Copy before Key events on some platforms;
+                // in a terminal Ctrl+C must always send ETX (interrupt), never clipboard copy.
+                egui::Event::Copy => Some(b"\x03"),
+                _ => None,
+            };
+            if let Some(b) = bytes {
+                to_send.push(b.to_vec());
+                to_remove.push(i);
             }
         }
 

@@ -11,6 +11,8 @@ pub enum ShellKind {
     PowerShell,
     Cmd,
     Bash,
+    /// Opens a PowerShell session and immediately launches the `claude` CLI.
+    Claude,
     Custom(String),
 }
 
@@ -21,24 +23,29 @@ impl ShellKind {
             ShellKind::PowerShell => "PowerShell",
             ShellKind::Cmd => "CMD",
             ShellKind::Bash => "Bash",
+            ShellKind::Claude => "Claude",
             ShellKind::Custom(s) => s.as_str(),
         }
     }
 
-    /// Build the shell command.  For PowerShell the initial directory and the
-    /// prompt-OSC hook are embedded directly in the `-Command` argument so they
-    /// execute before the first prompt appears and produce no visible output.
-    pub fn build_command(&self, initial_dir: Option<&str>) -> portable_pty::CommandBuilder {
+    /// Build the shell command.
+    ///
+    /// `startup_cmd` is embedded silently into the PowerShell `-Command` string.
+    /// For other shell kinds it is ignored here and handled via PTY input in
+    /// [`ShellSession::new`].
+    pub fn build_command(&self, initial_dir: Option<&str>, startup_cmd: Option<&str>) -> portable_pty::CommandBuilder {
         match self {
             ShellKind::PowerShell => {
                 let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
                 cmd.arg("-NoExit");
                 cmd.arg("-Command");
-                // Escape single-quotes in the path (PowerShell style: '' = literal ')
                 let cd_part = initial_dir
                     .map(|d| format!("Set-Location '{}';", d.replace('\'', "''")))
                     .unwrap_or_default();
-                // Everything runs at startup, before the first prompt — never visible.
+                let startup_part = startup_cmd
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("; {}", s))
+                    .unwrap_or_default();
                 cmd.arg(format!(
                     "[Console]::OutputEncoding=[Text.Encoding]::UTF8;\
                      $OutputEncoding=[Text.Encoding]::UTF8;\
@@ -47,7 +54,29 @@ impl ShellKind {
                          $p=$PWD.Path;\
                          [Console]::Write([char]27+']2;'+$p+[char]7);\
                          'PS '+$p+'> '\
-                     }}",
+                     }}{startup_part}",
+                ));
+                cmd
+            }
+            ShellKind::Claude => {
+                let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
+                cmd.arg("-NoExit");
+                cmd.arg("-Command");
+                let cd_part = initial_dir
+                    .map(|d| format!("Set-Location '{}';", d.replace('\'', "''")))
+                    .unwrap_or_default();
+                let claude_cmd = startup_cmd.unwrap_or("claude");
+                cmd.arg(format!(
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8;\
+                     $OutputEncoding=[Text.Encoding]::UTF8;\
+                     {cd_part}\
+                     function global:prompt{{\
+                         $p=$PWD.Path;\
+                         [Console]::Write([char]27+']2;'+$p+[char]7);\
+                         'PS '+$p+'> '\
+                     }};\
+                     [Console]::Write([char]27+']2;'+$PWD.Path+[char]7);\
+                     {claude_cmd}",
                 ));
                 cmd
             }
@@ -58,7 +87,13 @@ impl ShellKind {
                 cmd.env("LC_ALL", "en_US.UTF-8");
                 cmd
             }
-            ShellKind::Custom(s) => portable_pty::CommandBuilder::new(s),
+            ShellKind::Custom(s) => {
+                let mut cmd = portable_pty::CommandBuilder::new(s);
+                if let Some(dir) = initial_dir {
+                    cmd.cwd(dir);
+                }
+                cmd
+            }
         }
     }
 }
@@ -85,6 +120,7 @@ impl ShellSession {
         cols: u16,
         rows: u16,
         initial_dir: Option<String>,
+        startup_cmd: Option<String>,
     ) -> Self {
         let buffer = Arc::new(Mutex::new(TerminalBuffer::new(cols as usize, rows as usize)));
         let (input_tx, input_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(256);
@@ -122,13 +158,21 @@ impl ShellSession {
                 );
                 let _ = input_tx.send(init.into_bytes());
             }
-            // PowerShell: everything is embedded in build_command(); no stdin needed.
+            // PowerShell/Claude: everything is embedded in build_command(); no stdin needed.
             _ => {}
+        }
+
+        // For non-PS shells, send startup_cmd via PTY input (will echo in terminal).
+        // PS handles startup_cmd silently via -Command embedding in build_command().
+        if let Some(ref scmd) = startup_cmd {
+            if !scmd.is_empty() && !matches!(&kind, ShellKind::PowerShell | ShellKind::Claude) {
+                let _ = input_tx.send(format!("{}\r", scmd).into_bytes());
+            }
         }
 
         let buf_clone = buffer.clone();
         let alive_clone = alive.clone();
-        let cmd = kind.build_command(initial_dir.as_deref());
+        let cmd = kind.build_command(initial_dir.as_deref(), startup_cmd.as_deref());
 
         thread::spawn(move || {
             let pty_system = native_pty_system();
@@ -251,23 +295,25 @@ mod tests {
 
     #[test]
     fn build_command_does_not_panic_for_any_variant() {
-        ShellKind::PowerShell.build_command(None);
-        ShellKind::PowerShell.build_command(Some("C:\\Users"));
-        ShellKind::Cmd.build_command(None);
-        ShellKind::Cmd.build_command(Some("C:\\Temp"));
-        ShellKind::Bash.build_command(None);
-        ShellKind::Bash.build_command(Some("/home/user"));
-        ShellKind::Custom("echo".into()).build_command(None);
+        ShellKind::PowerShell.build_command(None, None);
+        ShellKind::PowerShell.build_command(Some("C:\\Users"), Some("claude"));
+        ShellKind::Cmd.build_command(None, None);
+        ShellKind::Cmd.build_command(Some("C:\\Temp"), None);
+        ShellKind::Bash.build_command(None, None);
+        ShellKind::Bash.build_command(Some("/home/user"), None);
+        ShellKind::Claude.build_command(None, None);
+        ShellKind::Claude.build_command(Some("C:\\Users"), None);
+        ShellKind::Custom("echo".into()).build_command(None, None);
     }
 
     #[test]
     fn powershell_command_with_dir_containing_single_quote() {
         // Should not panic when the path contains a single-quote
-        ShellKind::PowerShell.build_command(Some("C:\\Users\\O'Brien"));
+        ShellKind::PowerShell.build_command(Some("C:\\Users\\O'Brien"), None);
     }
 
     #[test]
     fn bash_command_with_dir_containing_single_quote() {
-        ShellKind::Bash.build_command(Some("/home/o'brien"));
+        ShellKind::Bash.build_command(Some("/home/o'brien"), None);
     }
 }
