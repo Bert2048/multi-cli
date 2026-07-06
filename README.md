@@ -1,49 +1,50 @@
 # multi-cli
 
-> GUI 版 tmux + VSCode Terminal —— 用 Rust 和 egui 构建的桌面多终端管理器
+> A GUI version of tmux + VSCode Terminal — a desktop multi-terminal manager built with Rust and egui
 
-在单个原生窗口内运行多个独立 Shell 会话，支持自由拖拽、平铺、层叠三种布局模式，深度集成 Claude CLI 多用户管理。
+Run multiple independent shell sessions inside a single native window with three layout modes (free/tile/cascade) and deep Claude CLI multi-user integration.
 
----
-
-## 功能特性
-
-### 多窗口终端
-- 每个 Shell 会话独立运行在真实 PTY 中
-- 窗口可自由拖拽、缩放、最小化、关闭
-- 三种布局模式：**Free**（自由）/ **Tile**（平铺）/ **Cascade**（层叠）
-- 一键最小化全部 / 一键还原全部
-
-### Shell 类型
-| Shell | 说明 |
-|-------|------|
-| **Claude** | 启动 Claude CLI，支持多用户、权限跳过、Telegram 插件 |
-| **PowerShell** | 注入 UTF-8 编码 + OSC 2 路径追踪 |
-| **CMD** | 启动时发送 `chcp 65001` 启用 UTF-8 |
-| **Bash** | 设置 `LANG`/`LC_ALL` + `PROMPT_COMMAND` 路径追踪 |
-| **Custom** | 任意可执行文件，支持配置初始目录和启动命令 |
-
-### Claude CLI 深度集成
-- **多用户切换**：工具栏下拉选择用户，每个用户配置独立 HOME 目录，启动时自动注入 `HOME` / `USERPROFILE` / `CLAUDE_CONFIG_DIR` 环境变量
-- **状态栏实时显示**：当前目录 · 当前用户 · 5小时 Token 用量 · 周用量
-- **快速切换工作目录**：双击状态栏弹出目录变更对话框，自动执行 `/exit` + 重启 Claude
-- **启动参数**：可勾选 `--dangerously-skip-permissions` 和 Telegram 插件
-
-### 终端渲染
-- 完整 VT100 / ANSI 转义序列解析（`vt100` crate）
-- CJK 宽字符支持（自动探测 `msyh.ttc` / `simsun.ttc` / `meiryo.ttc`）
-- 交替屏支持（vim、htop 等 TUI 应用）
-- 文本选择与右键复制
-
-### 会话持久化
-- 自动每 60 秒保存状态至 `%APPDATA%\multi-cli\state.json`
-- 退出时保存，启动时还原（窗口位置、大小、Shell 类型）
-- Claude / Custom Shell 还原时回到配置的初始目录
+[中文文档](README-cn.md)
 
 ---
 
-## 截图
+## Features
 
+### Multi-Window Terminal
+- Each shell session runs independently in a real PTY
+- Windows can be freely dragged, resized, minimized, and closed
+- Three layout modes: **Free** / **Tile** / **Cascade**
+- One-click minimize all / restore all
+
+### Shell Types
+| Shell | Description |
+|-------|-------------|
+| **Claude** | Launches the Claude CLI with multi-user support, permission skip, and Telegram plugin |
+| **PowerShell** | Injects UTF-8 encoding + OSC 2 path tracking |
+| **CMD** | Sends `chcp 65001` on startup to enable UTF-8 |
+| **Bash** | Sets `LANG`/`LC_ALL` + `PROMPT_COMMAND` for path tracking |
+| **Custom** | Any executable, with configurable initial directory and startup command |
+
+### Deep Claude CLI Integration
+- **Multi-user switching**: Select a user from the toolbar dropdown. Each user has its own HOME directory, and `HOME` / `USERPROFILE` / `CLAUDE_CONFIG_DIR` environment variables are injected automatically on launch
+- **Live status bar**: Current directory · Current user · 5-hour token usage · Weekly usage
+- **Quick working directory switch**: Double-click the status bar to open a directory change dialog. Automatically runs `/exit` and restarts Claude
+- **Launch options**: Toggle `--dangerously-skip-permissions` and the Telegram plugin
+
+### Terminal Rendering
+- Full VT100 / ANSI escape sequence parsing (via the `vt100` crate)
+- CJK wide character support (auto-detects `msyh.ttc` / `simsun.ttc` / `meiryo.ttc`)
+- Alternate screen support (for TUI apps like vim, htop)
+- Text selection and right-click copy
+
+### Session Persistence
+- Auto-saves state to `%APPDATA%\multi-cli\state.json` every 60 seconds
+- Saves on exit, restores on startup (window position, size, shell type)
+- Claude / Custom shells restore to their configured initial directory
+
+---
+
+## Screenshot
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -61,124 +62,124 @@
 
 ---
 
-## 安装与构建
+## Installation & Build
 
-**环境要求：** Rust 1.75+，Windows 10/11（使用 ConPTY）
+**Requirements:** Rust 1.75+, Windows 10/11 (uses ConPTY)
 
 ```bash
 git clone https://github.com/yourname/multi-cli
 cd multi-cli
 
-cargo build --release          # 编译
-cargo run                      # 直接运行
+cargo build --release          # build
+cargo run                      # run directly
 ```
 
-release 产物位于 `target/release/multi-cli.exe`。
+The release binary is at `target/release/multi-cli.exe`.
 
 ---
 
-## 快捷键
+## Keyboard Shortcuts
 
-| 操作 | 快捷键 / 鼠标 |
-|------|--------------|
-| 新建 Shell | `Ctrl+N` 或工具栏 `+ NEW` |
-| 移动窗口 | 拖拽标题栏 |
-| 调整窗口大小 | 拖拽右下角 `⤡` 手柄 |
-| 最小化窗口 | 标题栏黄色圆点 |
-| 关闭窗口 | 标题栏红色圆点 |
-| 重命名会话 | 双击侧边栏条目 |
-| 切换工作目录 | 双击 Claude/Custom 状态栏 |
-| 复制文本 | 选中文本后右键菜单 |
+| Action | Shortcut / Mouse |
+|--------|------------------|
+| New shell | `Ctrl+N` or toolbar `+ NEW` |
+| Move window | Drag title bar |
+| Resize window | Drag bottom-right `⤡` handle |
+| Minimize window | Yellow dot in title bar |
+| Close window | Red dot in title bar |
+| Rename session | Double-click sidebar entry |
+| Switch working directory | Double-click Claude/Custom status bar |
+| Copy text | Right-click menu after selection |
 
 ---
 
-## 设置说明
+## Settings
 
-点击工具栏右侧 `⚙ SETTINGS` 打开设置面板。
+Click `⚙ SETTINGS` on the right side of the toolbar to open the settings panel.
 
 ### APPEARANCE
-- **Font Size** — 终端字号（8–24px）
-- **Line Spacing** — 行高比例
+- **Font Size** — Terminal font size (8–24px)
+- **Line Spacing** — Line height ratio
 
 ### TERMINAL
-- **Default Shell** — Ctrl+N 和 NEW 按钮默认打开的 Shell 类型
-- **PTY Columns / Rows** — PTY 尺寸（新会话生效）
+- **Default Shell** — Shell type opened by `Ctrl+N` and the NEW button
+- **PTY Columns / Rows** — PTY dimensions (applies to new sessions)
 
 ### CLAUDE
-- **Directory** — Claude 会话默认工作目录
-- **Skip Permissions** — 启动时追加 `--dangerously-skip-permissions`
-- **Telegram** — 启动时追加 `--channels plugin:telegram@claude-plugins-official`
+- **Directory** — Default working directory for Claude sessions
+- **Skip Permissions** — Appends `--dangerously-skip-permissions` on launch
+- **Telegram** — Appends `--channels plugin:telegram@claude-plugins-official` on launch
 
-#### USERS — Claude 多用户管理
-| 字段 | 说明 |
-|------|------|
-| **Default** | 系统默认用户，路径 `~/.claude`，不注入环境变量 |
-| **Name** | 工具栏下拉显示名称 |
-| **Home Dir** | 该用户的 HOME 路径（如 `D:\home\alice`） |
+#### USERS — Claude Multi-User Management
+| Field | Description |
+|-------|-------------|
+| **Default** | System default user, path `~/.claude`, no injected environment variables |
+| **Name** | Display name shown in the toolbar dropdown |
+| **Home Dir** | HOME path for this user (e.g. `D:\home\alice`) |
 
-当配置 2 个及以上用户时，工具栏显示用户选择器。切换用户后，新建 Claude 窗口将注入：
+When two or more users are configured, the toolbar shows a user selector. After switching users, new Claude windows will inject:
 
 ```powershell
-$env:HOME          = "D:\home\alice"
-$env:USERPROFILE   = "D:\home\alice"
+$env:HOME              = "D:\home\alice"
+$env:USERPROFILE       = "D:\home\alice"
 $env:CLAUDE_CONFIG_DIR = "D:\home\alice\.claude"
 ```
 
 ### CUSTOM SHELLS
-自定义可执行文件，支持设置：显示名称、命令路径、初始目录、启动命令。
+Custom executables with configurable display name, command path, initial directory, and startup command.
 
 ### LAYOUT
-- **Sidebar Width** — 侧边栏宽度
+- **Sidebar Width** — Sidebar width
 
 ---
 
-## 状态栏说明
+## Status Bar
 
-Claude 会话窗口底部状态栏显示四段信息：
+The Claude session window's bottom status bar shows four segments:
 
 ```
 G:\Projects\multi-cli    Default │ 5h: 73% (1h20m) │ wk: 45% (3d6h)
-└── 当前工作目录 ─────┘   └─用户┘   └── 5h配额 ──┘   └── 周配额 ──┘
+└── working directory ┘   └user┘   └── 5h quota ─┘   └── weekly quota ┘
 ```
 
-- Token 数据每 **10 秒**更新一次
-- 如使用自定义用户，优先从其 `{home}/.claude/` 目录读取用量文件，无文件则解析终端输出
-- 时间显示为剩余重置倒计时
+- Token data updates every **10 seconds**
+- For custom users, usage is read from `{home}/.claude/` first; if unavailable, the terminal output is parsed
+- Time values show the countdown until the next reset
 
 ---
 
-## 项目结构
+## Project Structure
 
 ```
 src/
-├── main.rs             # eframe 入口，窗口尺寸 1280×800
-├── app.rs              # MultiCliApp — 渲染循环、输入分发、设置、工具栏、状态栏
-├── window_manager.rs   # WindowManager + ShellWindow — 布局、焦点、Z 轴
-├── shell_session.rs    # ShellSession — PTY 生命周期、读写线程
-└── terminal_buffer.rs  # TerminalBuffer — vt100 解析、CJK 宽字符检测
+├── main.rs             # eframe entry, 1280×800 window
+├── app.rs              # MultiCliApp — render loop, input dispatch, settings, toolbar, status bar
+├── window_manager.rs   # WindowManager + ShellWindow — layout, focus, z-order
+├── shell_session.rs    # ShellSession — PTY lifecycle, reader/writer threads
+└── terminal_buffer.rs  # TerminalBuffer — vt100 parsing, CJK wide character detection
 ```
 
-### 数据流
+### Data Flow
 
 ```
-输出：Shell → PTY 读线程 → TerminalBuffer::feed() → visible_lines() → egui painter
-输入：egui 键盘事件 → ShellSession::write_input() → PTY 写线程 → Shell
+Output: Shell → PTY reader thread → TerminalBuffer::feed() → visible_lines() → egui painter
+Input:  egui keyboard events → ShellSession::write_input() → PTY writer thread → Shell
 ```
 
 ---
 
-## 依赖
+## Dependencies
 
-| Crate | 版本 | 用途 |
-|-------|------|------|
-| `eframe` | 0.27 | egui 应用框架 |
-| `egui` | 0.27 | 立即模式 GUI |
-| `portable-pty` | 0.8 | 跨平台 PTY（Windows ConPTY） |
-| `vt100` | 0.15 | VT100/ANSI 终端解析 |
-| `crossbeam-channel` | 0.5 | 有界通道（PTY 输入背压） |
-| `uuid` | 1 | 会话/窗口唯一 ID |
-| `serde` + `serde_json` | 1 | 状态序列化 |
-| `arboard` | 3 | 剪贴板访问 |
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `eframe` | 0.27 | egui application framework |
+| `egui` | 0.27 | Immediate-mode GUI |
+| `portable-pty` | 0.8 | Cross-platform PTY (Windows ConPTY) |
+| `vt100` | 0.15 | VT100/ANSI terminal parsing |
+| `crossbeam-channel` | 0.5 | Bounded channel (PTY input backpressure) |
+| `uuid` | 1 | Session/window unique IDs |
+| `serde` + `serde_json` | 1 | State serialization |
+| `arboard` | 3 | Clipboard access |
 
 ---
 
