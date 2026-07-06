@@ -11,7 +11,9 @@ pub enum ShellKind {
     PowerShell,
     Cmd,
     Bash,
-    /// Opens a PowerShell session and immediately launches the `claude` CLI.
+    Zsh,
+    /// Opens a login shell (PowerShell on Windows, bash on Unix) and immediately
+    /// launches the `claude` CLI.
     Claude,
     Custom(String),
 }
@@ -23,9 +25,15 @@ impl ShellKind {
             ShellKind::PowerShell => "PowerShell",
             ShellKind::Cmd => "CMD",
             ShellKind::Bash => "Bash",
+            ShellKind::Zsh => "Zsh",
             ShellKind::Claude => "Claude",
             ShellKind::Custom(s) => s.as_str(),
         }
+    }
+
+    /// Sensible default shell for the current platform (used when no state exists).
+    pub fn platform_default() -> Self {
+        if cfg!(windows) { ShellKind::PowerShell } else { ShellKind::Zsh }
     }
 
     /// Build the shell command.
@@ -36,8 +44,7 @@ impl ShellKind {
     pub fn build_command(&self, initial_dir: Option<&str>, startup_cmd: Option<&str>) -> portable_pty::CommandBuilder {
         match self {
             ShellKind::PowerShell => {
-                let exe = if cfg!(windows) { "powershell.exe" } else { "pwsh" };
-                let mut cmd = portable_pty::CommandBuilder::new(exe);
+                let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
                 cmd.arg("-NoExit");
                 cmd.arg("-Command");
                 let cd_part = initial_dir
@@ -90,18 +97,16 @@ impl ShellKind {
                     cmd
                 }
             }
-            ShellKind::Cmd => {
-                if cfg!(windows) {
-                    portable_pty::CommandBuilder::new("cmd.exe")
-                } else {
-                    // No cmd on Unix — fall back to sh so the option is still usable.
-                    let mut cmd = portable_pty::CommandBuilder::new("sh");
-                    cmd.env("TERM", "xterm-256color");
-                    cmd
-                }
-            }
+            ShellKind::Cmd => portable_pty::CommandBuilder::new("cmd.exe"),
             ShellKind::Bash => {
                 let mut cmd = portable_pty::CommandBuilder::new("bash");
+                cmd.env("LANG", "en_US.UTF-8");
+                cmd.env("LC_ALL", "en_US.UTF-8");
+                cmd.env("TERM", "xterm-256color");
+                cmd
+            }
+            ShellKind::Zsh => {
+                let mut cmd = portable_pty::CommandBuilder::new("zsh");
                 cmd.env("LANG", "en_US.UTF-8");
                 cmd.env("LC_ALL", "en_US.UTF-8");
                 cmd.env("TERM", "xterm-256color");
@@ -175,6 +180,21 @@ impl ShellSession {
                     "stty -echo; \
                      {cd_part}\
                      PROMPT_COMMAND='printf \"\\033]2;%s\\007\" \"$PWD\"'; \
+                     stty echo\r"
+                );
+                let _ = input_tx.send(init.into_bytes());
+            }
+            ShellKind::Zsh => {
+                // zsh uses precmd_functions instead of PROMPT_COMMAND for OSC 2 title.
+                let cd_part = initial_dir
+                    .as_deref()
+                    .map(|d| format!("cd '{}' 2>/dev/null; ", d.replace('\'', "'\\''")))
+                    .unwrap_or_default();
+                let init = format!(
+                    "stty -echo; \
+                     {cd_part}\
+                     _multicli_title() {{ printf '\\033]2;%s\\007' \"$PWD\"; }}; \
+                     precmd_functions+=(_multicli_title); \
                      stty echo\r"
                 );
                 let _ = input_tx.send(init.into_bytes());
@@ -314,6 +334,18 @@ mod tests {
     fn label_bash() { assert_eq!(ShellKind::Bash.label(), "Bash"); }
 
     #[test]
+    fn label_zsh() { assert_eq!(ShellKind::Zsh.label(), "Zsh"); }
+
+    #[test]
+    fn platform_default_matches_current_os() {
+        if cfg!(windows) {
+            assert_eq!(ShellKind::platform_default(), ShellKind::PowerShell);
+        } else {
+            assert_eq!(ShellKind::platform_default(), ShellKind::Zsh);
+        }
+    }
+
+    #[test]
     fn label_custom_returns_inner_string() {
         assert_eq!(ShellKind::Custom("fish".into()).label(), "fish");
         assert_eq!(ShellKind::Custom("zsh".into()).label(), "zsh");
@@ -345,6 +377,8 @@ mod tests {
         ShellKind::Cmd.build_command(Some("C:\\Temp"), None);
         ShellKind::Bash.build_command(None, None);
         ShellKind::Bash.build_command(Some("/home/user"), None);
+        ShellKind::Zsh.build_command(None, None);
+        ShellKind::Zsh.build_command(Some("/home/user"), None);
         ShellKind::Claude.build_command(None, None);
         ShellKind::Claude.build_command(Some("C:\\Users"), None);
         ShellKind::Custom("echo".into()).build_command(None, None);

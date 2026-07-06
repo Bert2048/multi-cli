@@ -414,8 +414,10 @@ impl MultiCliApp {
                                 match kind_raw {
                                     "CMD" | "Cmd" => ShellKind::Cmd,
                                     "Bash" => ShellKind::Bash,
+                                    "Zsh" => ShellKind::Zsh,
                                     "Claude" => ShellKind::Claude,
-                                    _ => ShellKind::PowerShell,
+                                    "PowerShell" => ShellKind::PowerShell,
+                                    _ => ShellKind::platform_default(),
                                 }
                             };
                             let pos_x = w["pos_x"].as_f64().unwrap_or(160.0) as f32;
@@ -478,7 +480,7 @@ impl MultiCliApp {
             }
         }
         // fallback
-        self.spawn_shell(ShellKind::PowerShell);
+        self.spawn_shell(ShellKind::platform_default());
     }
 
     fn load_state_or_default(&mut self) {
@@ -488,7 +490,7 @@ impl MultiCliApp {
                 return;
             }
         }
-        self.spawn_shell(ShellKind::PowerShell);
+        self.spawn_shell(ShellKind::platform_default());
     }
 
     /// Draws the floating settings window. Returns `true` if the window should
@@ -574,14 +576,21 @@ impl MultiCliApp {
                                         ShellKind::Custom(c.cmd.clone()), label,
                                     );
                                 }
-                                ui.selectable_value(
-                                    &mut self.settings.default_shell,
-                                    ShellKind::PowerShell, "PowerShell",
-                                );
-                                ui.selectable_value(
-                                    &mut self.settings.default_shell,
-                                    ShellKind::Cmd, "CMD",
-                                );
+                                if cfg!(windows) {
+                                    ui.selectable_value(
+                                        &mut self.settings.default_shell,
+                                        ShellKind::PowerShell, "PowerShell",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.settings.default_shell,
+                                        ShellKind::Cmd, "CMD",
+                                    );
+                                } else {
+                                    ui.selectable_value(
+                                        &mut self.settings.default_shell,
+                                        ShellKind::Zsh, "Zsh",
+                                    );
+                                }
                                 ui.selectable_value(
                                     &mut self.settings.default_shell,
                                     ShellKind::Bash, "Bash",
@@ -1172,8 +1181,12 @@ impl eframe::App for MultiCliApp {
                                     label,
                                 );
                             }
-                            ui.selectable_value(&mut self.new_shell_kind, ShellKind::PowerShell, "PowerShell");
-                            ui.selectable_value(&mut self.new_shell_kind, ShellKind::Cmd, "CMD");
+                            if cfg!(windows) {
+                                ui.selectable_value(&mut self.new_shell_kind, ShellKind::PowerShell, "PowerShell");
+                                ui.selectable_value(&mut self.new_shell_kind, ShellKind::Cmd, "CMD");
+                            } else {
+                                ui.selectable_value(&mut self.new_shell_kind, ShellKind::Zsh, "Zsh");
+                            }
                             ui.selectable_value(&mut self.new_shell_kind, ShellKind::Bash, "Bash");
                         });
 
