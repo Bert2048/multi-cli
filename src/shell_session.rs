@@ -36,6 +36,16 @@ impl ShellKind {
         if cfg!(windows) { ShellKind::PowerShell } else { ShellKind::Zsh }
     }
 
+    /// True if this variant can actually be launched on the current OS.
+    /// PowerShell/Cmd are Windows-only; Zsh is Unix-only.
+    pub fn is_available(&self) -> bool {
+        match self {
+            ShellKind::PowerShell | ShellKind::Cmd => cfg!(windows),
+            ShellKind::Zsh => !cfg!(windows),
+            _ => true,
+        }
+    }
+
     /// Build the shell command.
     ///
     /// `startup_cmd` is embedded silently into the PowerShell `-Command` string.
@@ -89,8 +99,13 @@ impl ShellKind {
                     ));
                     cmd
                 } else {
-                    // Unix: spawn interactive bash; init string + claude sent via stdin in ShellSession::new.
-                    let mut cmd = portable_pty::CommandBuilder::new("bash");
+                    // Unix: spawn the user's login shell so ~/.zprofile / ~/.bash_profile
+                    // populate PATH (needed to find `claude` when the app is launched
+                    // from a GUI where PATH would otherwise be minimal).
+                    // The claude command itself is sent via stdin in ShellSession::new.
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let mut cmd = portable_pty::CommandBuilder::new(shell);
+                    cmd.arg("-l");
                     cmd.env("LANG", "en_US.UTF-8");
                     cmd.env("LC_ALL", "en_US.UTF-8");
                     cmd.env("TERM", "xterm-256color");
@@ -200,7 +215,9 @@ impl ShellSession {
                 let _ = input_tx.send(init.into_bytes());
             }
             ShellKind::Claude if !cfg!(windows) => {
-                // Unix Claude: bash init + launch claude via stdin.
+                // Unix Claude: cd + launch claude via stdin. The shell is a login shell
+                // (-l), which sourced ~/.zprofile / ~/.bash_profile so PATH already
+                // includes user-configured directories (e.g. ~/.local/bin).
                 let cd_part = initial_dir
                     .as_deref()
                     .map(|d| format!("cd '{}' 2>/dev/null; ", d.replace('\'', "'\\''")))
@@ -209,9 +226,8 @@ impl ShellSession {
                 let init = format!(
                     "stty -echo; \
                      {cd_part}\
-                     PROMPT_COMMAND='printf \"\\033]2;%s\\007\" \"$PWD\"'; \
-                     stty echo; \
                      printf '\\033]2;%s\\007' \"$PWD\"; \
+                     stty echo; \
                      {claude_cmd}\r"
                 );
                 let _ = input_tx.send(init.into_bytes());

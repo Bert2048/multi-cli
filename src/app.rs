@@ -411,14 +411,17 @@ impl MultiCliApp {
                             let kind = if let Some(exe) = kind_raw.strip_prefix("Custom:") {
                                 ShellKind::Custom(exe.to_string())
                             } else {
-                                match kind_raw {
+                                let parsed = match kind_raw {
                                     "CMD" | "Cmd" => ShellKind::Cmd,
                                     "Bash" => ShellKind::Bash,
                                     "Zsh" => ShellKind::Zsh,
                                     "Claude" => ShellKind::Claude,
                                     "PowerShell" => ShellKind::PowerShell,
                                     _ => ShellKind::platform_default(),
-                                }
+                                };
+                                // A window saved on the other OS: swap it to the current
+                                // platform's default so restore still succeeds.
+                                if parsed.is_available() { parsed } else { ShellKind::platform_default() }
                             };
                             let pos_x = w["pos_x"].as_f64().unwrap_or(160.0) as f32;
                             let pos_y = w["pos_y"].as_f64().unwrap_or(40.0) as f32;
@@ -2419,6 +2422,12 @@ fn load_settings_from_disk() -> AppSettings {
                 // Migrate zero limits from old saves — 0 means "not configured yet".
                 if s.token_5h_limit == 0 { s.token_5h_limit = default_token_5h_limit(); }
                 if s.token_week_limit == 0 { s.token_week_limit = default_token_week_limit(); }
+                // A settings file created on Windows may hold PowerShell/Cmd;
+                // on macOS/Linux it would hold Zsh. Swap to the current platform's
+                // default when the saved choice isn't runnable here.
+                if !s.default_shell.is_available() {
+                    s.default_shell = ShellKind::platform_default();
+                }
                 return s;
             }
         }
