@@ -17,6 +17,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Multi-CLI",
         native_options,
-        Box::new(|cc| Box::new(MultiCliApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(MultiCliApp::new(cc)))),
     )
 }

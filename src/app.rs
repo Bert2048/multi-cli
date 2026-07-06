@@ -526,7 +526,7 @@ impl MultiCliApp {
                             egui::Slider::new(&mut self.settings.font_size, 8.0..=24.0)
                                 .step_by(0.5)
                                 .suffix(" px")
-                                .clamp_to_range(true),
+                                .clamping(egui::SliderClamping::Always),
                         );
                         ui.end_row();
 
@@ -536,7 +536,7 @@ impl MultiCliApp {
                                 .step_by(0.05)
                                 .fixed_decimals(2)
                                 .suffix("×")
-                                .clamp_to_range(true),
+                                .clamping(egui::SliderClamping::Always),
                         );
                         ui.end_row();
                     });
@@ -558,7 +558,7 @@ impl MultiCliApp {
                                 .unwrap_or_else(|| exe.clone()),
                             k => k.label().to_string(),
                         };
-                        egui::ComboBox::from_id_source("settings_shell_combo")
+                        egui::ComboBox::from_id_salt("settings_shell_combo")
                             .selected_text(default_shell_label)
                             .width(150.0)
                             .show_ui(ui, |ui| {
@@ -592,14 +592,14 @@ impl MultiCliApp {
                         ui.label(settings_label("PTY Columns"));
                         ui.add(
                             egui::Slider::new(&mut self.settings.pty_cols, 40u16..=300u16)
-                                .clamp_to_range(true),
+                                .clamping(egui::SliderClamping::Always),
                         );
                         ui.end_row();
 
                         ui.label(settings_label("PTY Rows"));
                         ui.add(
                             egui::Slider::new(&mut self.settings.pty_rows, 10u16..=100u16)
-                                .clamp_to_range(true),
+                                .clamping(egui::SliderClamping::Always),
                         );
                         ui.end_row();
                     });
@@ -905,7 +905,7 @@ impl MultiCliApp {
                         ui.add(
                             egui::Slider::new(&mut self.settings.sidebar_width, 80.0..=300.0)
                                 .suffix(" px")
-                                .clamp_to_range(true),
+                                .clamping(egui::SliderClamping::Always),
                         );
                         ui.end_row();
                     });
@@ -1160,7 +1160,7 @@ impl eframe::App for MultiCliApp {
                         .filter(|c| !c.cmd.is_empty())
                         .map(|c| (c.cmd.clone(), if c.name.is_empty() { c.cmd.clone() } else { c.name.clone() }))
                         .collect();
-                    egui::ComboBox::from_id_source("shell_kind")
+                    egui::ComboBox::from_id_salt("shell_kind")
                         .selected_text(combo_label)
                         .width(110.0)
                         .show_ui(ui, |ui| {
@@ -1196,7 +1196,7 @@ impl eframe::App for MultiCliApp {
                                 })
                                 .unwrap_or_else(|| "Default".to_string())
                         };
-                        egui::ComboBox::from_id_source("claude_user_combo")
+                        egui::ComboBox::from_id_salt("claude_user_combo")
                             .selected_text(format!("👤 {}", user_label))
                             .width(120.0)
                             .show_ui(ui, |ui| {
@@ -1500,7 +1500,7 @@ impl eframe::App for MultiCliApp {
                             spread: 1.5,
                             color: Color32::from_rgba_unmultiplied(80, 200, 160, 70),
                         };
-                        painter.add(egui::Shape::Mesh(glow.tessellate(win_rect, Rounding::same(4.0))));
+                        painter.add(egui::Shape::Rect(glow.as_shape(win_rect, Rounding::same(4.0))));
                     }
 
                     // Window background (masks shadow interior, leaving only outer halo)
@@ -1913,7 +1913,7 @@ impl eframe::App for MultiCliApp {
                                             }
                                         }
                                         // IME composition confirmed
-                                        egui::Event::CompositionEnd(t) => {
+                                        egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
                                             session.write_input(t.as_bytes());
                                         }
                                         // Clipboard paste (Ctrl+V / Shift+Insert)
