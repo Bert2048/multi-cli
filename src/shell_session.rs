@@ -36,7 +36,8 @@ impl ShellKind {
     pub fn build_command(&self, initial_dir: Option<&str>, startup_cmd: Option<&str>) -> portable_pty::CommandBuilder {
         match self {
             ShellKind::PowerShell => {
-                let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
+                let exe = if cfg!(windows) { "powershell.exe" } else { "pwsh" };
+                let mut cmd = portable_pty::CommandBuilder::new(exe);
                 cmd.arg("-NoExit");
                 cmd.arg("-Command");
                 let cd_part = initial_dir
@@ -59,32 +60,51 @@ impl ShellKind {
                 cmd
             }
             ShellKind::Claude => {
-                let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
-                cmd.arg("-NoExit");
-                cmd.arg("-Command");
-                let cd_part = initial_dir
-                    .map(|d| format!("Set-Location '{}';", d.replace('\'', "''")))
-                    .unwrap_or_default();
-                let claude_cmd = startup_cmd.unwrap_or("claude");
-                cmd.arg(format!(
-                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8;\
-                     $OutputEncoding=[Text.Encoding]::UTF8;\
-                     {cd_part}\
-                     function global:prompt{{\
-                         $p=$PWD.Path;\
-                         [Console]::Write([char]27+']2;'+$p+[char]7);\
-                         'PS '+$p+'> '\
-                     }};\
-                     [Console]::Write([char]27+']2;'+$PWD.Path+[char]7);\
-                     {claude_cmd}",
-                ));
-                cmd
+                if cfg!(windows) {
+                    let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
+                    cmd.arg("-NoExit");
+                    cmd.arg("-Command");
+                    let cd_part = initial_dir
+                        .map(|d| format!("Set-Location '{}';", d.replace('\'', "''")))
+                        .unwrap_or_default();
+                    let claude_cmd = startup_cmd.unwrap_or("claude");
+                    cmd.arg(format!(
+                        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;\
+                         $OutputEncoding=[Text.Encoding]::UTF8;\
+                         {cd_part}\
+                         function global:prompt{{\
+                             $p=$PWD.Path;\
+                             [Console]::Write([char]27+']2;'+$p+[char]7);\
+                             'PS '+$p+'> '\
+                         }};\
+                         [Console]::Write([char]27+']2;'+$PWD.Path+[char]7);\
+                         {claude_cmd}",
+                    ));
+                    cmd
+                } else {
+                    // Unix: spawn interactive bash; init string + claude sent via stdin in ShellSession::new.
+                    let mut cmd = portable_pty::CommandBuilder::new("bash");
+                    cmd.env("LANG", "en_US.UTF-8");
+                    cmd.env("LC_ALL", "en_US.UTF-8");
+                    cmd.env("TERM", "xterm-256color");
+                    cmd
+                }
             }
-            ShellKind::Cmd => portable_pty::CommandBuilder::new("cmd.exe"),
+            ShellKind::Cmd => {
+                if cfg!(windows) {
+                    portable_pty::CommandBuilder::new("cmd.exe")
+                } else {
+                    // No cmd on Unix — fall back to sh so the option is still usable.
+                    let mut cmd = portable_pty::CommandBuilder::new("sh");
+                    cmd.env("TERM", "xterm-256color");
+                    cmd
+                }
+            }
             ShellKind::Bash => {
                 let mut cmd = portable_pty::CommandBuilder::new("bash");
                 cmd.env("LANG", "en_US.UTF-8");
                 cmd.env("LC_ALL", "en_US.UTF-8");
+                cmd.env("TERM", "xterm-256color");
                 cmd
             }
             ShellKind::Custom(s) => {
@@ -159,12 +179,29 @@ impl ShellSession {
                 );
                 let _ = input_tx.send(init.into_bytes());
             }
-            // PowerShell/Claude: everything is embedded in build_command(); no stdin needed.
+            ShellKind::Claude if !cfg!(windows) => {
+                // Unix Claude: bash init + launch claude via stdin.
+                let cd_part = initial_dir
+                    .as_deref()
+                    .map(|d| format!("cd '{}' 2>/dev/null; ", d.replace('\'', "'\\''")))
+                    .unwrap_or_default();
+                let claude_cmd = startup_cmd.as_deref().unwrap_or("claude");
+                let init = format!(
+                    "stty -echo; \
+                     {cd_part}\
+                     PROMPT_COMMAND='printf \"\\033]2;%s\\007\" \"$PWD\"'; \
+                     stty echo; \
+                     printf '\\033]2;%s\\007' \"$PWD\"; \
+                     {claude_cmd}\r"
+                );
+                let _ = input_tx.send(init.into_bytes());
+            }
+            // Windows PowerShell/Claude: everything is embedded in build_command(); no stdin needed.
             _ => {}
         }
 
         // For non-PS shells, send startup_cmd via PTY input (will echo in terminal).
-        // PS handles startup_cmd silently via -Command embedding in build_command().
+        // PS/Claude handle startup_cmd via -Command embedding (Windows) or the init block above (Unix).
         if let Some(ref scmd) = startup_cmd {
             if !scmd.is_empty() && !matches!(&kind, ShellKind::PowerShell | ShellKind::Claude) {
                 let _ = input_tx.send(format!("{}\r", scmd).into_bytes());
@@ -177,7 +214,8 @@ impl ShellSession {
         if let Some(ref home) = user_home {
             cmd.env("HOME", home);
             cmd.env("USERPROFILE", home);
-            cmd.env("CLAUDE_CONFIG_DIR", format!("{}\\.claude", home));
+            let claude_cfg = std::path::PathBuf::from(home).join(".claude");
+            cmd.env("CLAUDE_CONFIG_DIR", claude_cfg);
         }
 
         thread::spawn(move || {

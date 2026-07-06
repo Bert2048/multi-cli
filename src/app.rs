@@ -2244,12 +2244,27 @@ impl eframe::App for MultiCliApp {
 
 fn setup_cjk_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let candidates = [
+    #[cfg(windows)]
+    let candidates: &[&str] = &[
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simsun.ttc",
         "C:/Windows/Fonts/meiryo.ttc",
     ];
-    for path in &candidates {
+    #[cfg(target_os = "macos")]
+    let candidates: &[&str] = &[
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Songti.ttc",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[&str] = &[
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ];
+    for path in candidates {
         if let Ok(data) = std::fs::read(path) {
             fonts.font_data.insert(
                 "cjk".to_owned(),
@@ -2354,19 +2369,34 @@ fn key_to_bytes(key: &Key, modifiers: &egui::Modifiers) -> Option<&'static [u8]>
     }
 }
 
-/// Returns the path to `%APPDATA%/multi-cli/state.json`, creating the directory
-/// if it does not exist.  Returns `None` if `APPDATA` is unset or the directory
-/// could not be created.
-fn state_path() -> Option<std::path::PathBuf> {
+/// Platform-appropriate config directory:
+/// - Windows: `%APPDATA%\multi-cli`
+/// - macOS:   `~/Library/Application Support/multi-cli`
+/// - Linux:   `$XDG_CONFIG_HOME/multi-cli` or `~/.config/multi-cli`
+fn config_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
     let dir = std::path::PathBuf::from(std::env::var("APPDATA").ok()?).join("multi-cli");
+    #[cfg(target_os = "macos")]
+    let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+        .join("Library")
+        .join("Application Support")
+        .join("multi-cli");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let dir = std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .ok()?
+        .join("multi-cli");
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("state.json"))
+    Some(dir)
+}
+
+fn state_path() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("state.json"))
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
-    let dir = std::path::PathBuf::from(std::env::var("APPDATA").ok()?).join("multi-cli");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("settings.json"))
+    Some(config_dir()?.join("settings.json"))
 }
 
 fn load_settings_from_disk() -> AppSettings {
